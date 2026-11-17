@@ -73,6 +73,9 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
 #include "ggml.h"
+#if defined(GGML_USE_HIP)
+#include "../ggml-hip/ggml-hip-ssd.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -1510,10 +1513,20 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_SSD_V2)
+    if (ggml_hip_ssd::apu_v2_engine::instance().free_zero_copy(buffer->context)) {
+        return;
+    }
+#endif
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
 static void * ggml_cuda_host_malloc(size_t size) {
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_SSD_V2)
+    if (void * gtt_ptr = ggml_hip_ssd::apu_v2_engine::instance().alloc_zero_copy(size)) {
+        return gtt_ptr;
+    }
+#endif
     if (ggml_cuda_pinned_memory_disabled()) {
         return nullptr;
     }
@@ -2349,6 +2362,9 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 }
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_SSD_V2)
+    (void) ggml_hip_ssd::apu_v2_engine::instance().on_mul_mat_id_dispatch(dst, nullptr, 0);
+#endif
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -5128,6 +5144,11 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 #endif // USE_CUDA_GRAPH
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_SSD_V2)
+    if (ggml_hip_ssd::apu_v2_engine::instance().snapshot().routing_mode == ggml_hip_ssd::workload_routing_mode::UNDECIDED) {
+        (void) ggml_hip_ssd::apu_v2_engine::instance().inspect_compute_graph(cgraph, nullptr);
+    }
+#endif
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);

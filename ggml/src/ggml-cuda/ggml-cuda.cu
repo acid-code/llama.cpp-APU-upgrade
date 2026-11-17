@@ -73,6 +73,9 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
 #include "ggml.h"
+#if defined(GGML_USE_HIP)
+#include "../ggml-hip/ggml-hip-ssd.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -1510,10 +1513,20 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_SSD_V1)
+    if (ggml_hip_ssd::gtt_zero_copy_arena::instance().free_zero_copy(buffer->context)) {
+        return;
+    }
+#endif
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
 static void * ggml_cuda_host_malloc(size_t size) {
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_SSD_V1)
+    if (void * gtt_ptr = ggml_hip_ssd::gtt_zero_copy_arena::instance().alloc_zero_copy(size)) {
+        return gtt_ptr;
+    }
+#endif
     if (ggml_cuda_pinned_memory_disabled()) {
         return nullptr;
     }

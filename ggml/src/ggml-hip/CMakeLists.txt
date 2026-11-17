@@ -73,6 +73,11 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
 ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
+# Custom V2 ggml-hip-ssd backend for AMD Ryzen 7 8745HS / Radeon 780M APU
+list(APPEND GGML_HEADERS_ROCM "ggml-hip-ssd.h")
+list(APPEND GGML_SOURCES_ROCM "ggml-hip-ssd.cpp")
+add_compile_definitions(GGML_HIP_SSD_V2=1)
+
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}

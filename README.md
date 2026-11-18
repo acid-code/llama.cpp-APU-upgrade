@@ -85,12 +85,19 @@ We also tested splitting 16 out of 40 MoE layers of `Qwen3.6-35B-A3B` onto the Z
 - **Hybrid Split (16 MoE layers on Zen 4 CPU + 24 on 780M iGPU)**: **41.0 tok/s** Prompt | **15.5 tok/s** Decode
 - **Conclusion:** Because the Zen 4 CPU and Radeon 780M share the same dual-channel DDR5 memory controller (~75 GB/s), splitting layers onto the CPU when the model fits inside the 40 GiB GTT pool adds 32 CPU<->GPU `hipStreamSynchronize` barriers per token without adding memory bandwidth. **Always keep 100% of layers in `ROCm0` (`-ngl 999 -ngld 999`) for models <= 38 GiB**, and reserve CPU/GTT hybrid streaming for oversized MoE models (>45 GiB) that exceed physical RAM.
 
-### Oversized Out-of-Core SSD Offloading Test: `GLM-4.5-Air-UD-IQ3_XXS` (106B-A12B, 47.9 GiB)
-We also benchmarked an oversized MoE model larger than the 45 GiB system RAM (`GLM-4.5-Air-UD-IQ3_XXS`, `47.9 GiB` on NVMe SSD) using `-ngl 0 -lm mmap -fit off -ub 64 -b 64 -t 12 -c 2048` (`HIP_VISIBLE_DEVICES=-1`):
-- **Prompt Prefill (512 tokens):** **13.1 tok/s**
-- **Generation / Decode (128 tokens):** **3.6 tok/s**
-- **Peak RSS & Real SSD I/O:** `43.59 GiB` RSS, `850,627` major page faults (`~83.3 GiB` streamed from NVMe SSD across the run)
-- **Takeaway for `local-agent`:** Running >45 GiB models from SSD works cleanly without crashing, **but** at `3.6 tok/s` decode / `13.1 tok/s` prefill (8x-12x slower than `Qwen3.6-35B-A3B` + `DFlash2`). Only use >45 GiB SSD-offloaded models for rare offline/overnight deep-research jobs, **not** interactive `local-agent` coding or tool loops.
+### Oversized Out-of-Core SSD Offloading Tests (>43 GiB Models)
+We benchmarked all three oversized MoE models on `mini-pc` (`45 GiB` RAM + PCIe Gen4 NVMe SSD) using `dspine-v2-custom` (`-lm mmap -fit off -ub 64 -b 64 -t 12 -ngl 0`, `HIP_VISIBLE_DEVICES=-1`):
+
+| Model | Params (Total / Active) | Disk Size | Key Flags | Prompt (`tok/s`) | Decode (`tok/s`) | Peak RSS | SSD Major Page Faults |
+| :--- | :---: | :---: | :--- | :---: | :---: | :---: | :---: |
+| **`GLM-4.5-Air-UD-IQ3_XXS`** | 106B / 12B | `47.9 GiB` | `-c 2048` | **13.1** | **3.6** | `43.59 GiB` | `850,627` |
+| **`Llama-4-Scout-Q3_K_S`** | 109B / 17B | `43.5 GiB` | `-c 4096 -t 16` | **12.5** | **1.8** | `25.86 GiB` | `426,327` |
+| **`Qwen3-235B-A22B-UD-Q2_K_XL`** | 235B / 22B | `82.7 GiB` | `--no-repack -c 2048` | **1.6** | **0.7** | `22.76 GiB` | `519,245` |
+
+- **Key Findings:**
+  1. **`--no-repack` is mandatory for >45 GiB models on Zen 4:** Without `--no-repack`, `llama.cpp`'s `CPU_REPACK` tries to `malloc` an extra 83 GiB repack buffer in RAM and fails to load `Qwen3-235B-A22B`.
+  2. **Why Hybrid `--n-cpu-moe 999` failed on `ROCm0`:** Splitting Attention on `ROCm0` and MoE experts on `CPU` bounces activations between `ROCm0` and `ROCm_Host` (`userptr`) 45-94 times per token, triggering Linux KFD `svm_range_restore_work` page-table thrashing and `MES` GPU resets on `gfx1103`.
+  3. **Takeaway for `local-agent`:** All 3 oversized models run without crashing, **but** at `0.7 - 3.6 tok/s` decode and `1.6 - 13.1 tok/s` prefill (vs `27.8 - 36.8 tok/s` decode / `165.2 tok/s` prefill on `Qwen3.6-35B-A3B` + `DFlash2`). Reserve `GLM-4.5-Air` (`3.6 tok/s`) or `Qwen3-235B` (`0.7 tok/s`) strictly for rare overnight/offline deep-reasoning jobs—use **`Qwen3.6-35B-A3B` + `DFlash2`** for all interactive `local-agent` work.
 
 ---
 

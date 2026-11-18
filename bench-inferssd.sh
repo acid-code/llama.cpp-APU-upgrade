@@ -29,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-$SCRIPT_DIR}"
 CSV_OUT="${CSV_OUT:-${REPO_DIR}/benchmark_results.csv}"
 BUILD_ROOT="${BUILD_ROOT:-/tmp/llama-apu-bench-builds}"
-GPU_TARGET="${GPU_TARGET:-gfx1103}"
+GPU_TARGET="${GPU_TARGET:-gfx1100}"
 PROMPT_TOKENS="${PROMPT_TOKENS:-512}"
 GEN_TOKENS="${GEN_TOKENS:-256}"
 
@@ -105,6 +105,12 @@ trap cleanup EXIT
 
 export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.0.0}"
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
+
+if [[ -e /dev/kfd && ! -w /dev/kfd ]]; then
+    echo "ERROR: Current user ($(id -un)) does not have write access to /dev/kfd." >&2
+    echo "Run: sudo usermod -aG render,video $(id -un) && sudo chmod 666 /dev/kfd /dev/dri/render* /dev/dri/card*" >&2
+    exit 1
+fi
 
 # Initialize CSV header
 echo "Model Name,Branch Name,Block Size,Tokens-per-Second,Draft Acceptance Rate" > "$CSV_OUT"
@@ -217,6 +223,7 @@ for branch in "${BRANCHES[@]}"; do
     cmake -S . -B "$BDIR" \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_HIP=ON \
+        -DCMAKE_HIP_ARCHITECTURES="$GPU_TARGET" \
         -DAMDGPU_TARGETS="$GPU_TARGET" \
         -DGPU_TARGETS="$GPU_TARGET" \
         >"${BDIR}/cmake-config.log" 2>&1
@@ -243,6 +250,7 @@ for branch in "${BRANCHES[@]}"; do
         if [[ "$branch" == dspine-* ]]; then
             # Drafting Logic: loop through draft block sizes 8, 12, 16, and 20
             for bsize in "${DRAFT_BLOCK_SIZES[@]}"; do
+                sleep 2
                 echo "     [Run] branch=${branch} model=${model_name} draft_block_size=${bsize}..."
                 log_file="${BDIR}/run-${model_name}-b${bsize}.log"
                 metrics="$(run_inference_and_parse "$BIN_DIR" "$model_path" "$branch" "$bsize" "$log_file")"
@@ -253,6 +261,7 @@ for branch in "${BRANCHES[@]}"; do
             done
         else
             # Standard non-drafting inference
+            sleep 2
             echo "     [Run] branch=${branch} model=${model_name} (non-drafting)..."
             log_file="${BDIR}/run-${model_name}-standard.log"
             metrics="$(run_inference_and_parse "$BIN_DIR" "$model_path" "$branch" "N/A" "$log_file")"

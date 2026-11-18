@@ -581,19 +581,22 @@ struct apu_v2_engine::impl {
             std::lock_guard<std::mutex> ulock(uring_mutex);
             if (uring_workers.empty() && !uring_stopping) {
                 const size_t total_slot_bytes = kDefaultGttPrefetchSlots * prefetch_slot_bytes;
-                {
-                    std::lock_guard<std::mutex> alock(mutex);
-                    if (!prefetch_arena_host) {
-                        prefetch_arena_host = alloc_zero_copy_locked(total_slot_bytes);
+                if (!prefetch_arena_host) {
+#if defined(__linux__)
+                    if (posix_memalign(&prefetch_arena_host, kGttPageAlignment, total_slot_bytes) != 0) {
+                        prefetch_arena_host = nullptr;
                     }
+#else
+                    prefetch_arena_host = std::malloc(total_slot_bytes);
+#endif
                 }
                 if (prefetch_arena_host) {
+                    std::memset(prefetch_arena_host, 0, total_slot_bytes);
                     char * host_base = static_cast<char *>(prefetch_arena_host);
-                    char * dev_base  = static_cast<char *>(resolve_device_ptr(prefetch_arena_host));
                     prefetch_slots.resize(kDefaultGttPrefetchSlots);
                     for (size_t i = 0; i < kDefaultGttPrefetchSlots; ++i) {
                         prefetch_slots[i].host_ptr = host_base + i * prefetch_slot_bytes;
-                        prefetch_slots[i].dev_ptr  = dev_base + i * prefetch_slot_bytes;
+                        prefetch_slots[i].dev_ptr  = host_base + i * prefetch_slot_bytes;
                         prefetch_slots[i].capacity = prefetch_slot_bytes;
                     }
                 }
@@ -930,16 +933,18 @@ struct apu_v2_engine::impl {
         }
 
         std::lock_guard<std::mutex> lock(mutex);
-        if (!initialized && allocations.empty()) {
+        if (!initialized && allocations.empty() && !prefetch_arena_host) {
             return;
         }
-        for (const auto & kv : allocations) {
-            if (kv.second.raw_host) {
-                (void) hipHostFree(kv.second.raw_host);
-            }
-        }
+        // Note: Do not call hipHostFree inside the static destructor at process exit(),
+        // as libhsa-runtime64 may already be tearing down KFD MES queues (which causes
+        // remove_all_kfd_queues_mes MES queue hangs on gfx1103). All ggml host buffers
+        // are already freed via free_zero_copy() during llama_free() before exit().
         allocations.clear();
-        prefetch_arena_host = nullptr;
+        if (prefetch_arena_host) {
+            std::free(prefetch_arena_host);
+            prefetch_arena_host = nullptr;
+        }
         prefetch_slots.clear();
 
         std::fprintf(stderr,

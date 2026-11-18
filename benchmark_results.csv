@@ -1,0 +1,23 @@
+Model Name,Branch Name,Block Size,Tokens-per-Second,Draft Acceptance Rate
+gpt-oss-20b-Q4_K_M,main,N/A,24.70,N/A
+Qwen3.6-35B-A3B-UD-Q4_K_M,main,N/A,18.80,N/A
+gpt-oss-20b-Q4_K_M,v1-custom,N/A,24.70,N/A
+Qwen3.6-35B-A3B-UD-Q4_K_M,v1-custom,N/A,18.30,N/A
+gpt-oss-20b-Q4_K_M,v2-custom,N/A,24.60,N/A
+Qwen3.6-35B-A3B-UD-Q4_K_M,v2-custom,N/A,18.10,N/A
+gpt-oss-20b-Q4_K_M,dspine-baseline,8,24.41,12.05%
+gpt-oss-20b-Q4_K_M,dspine-baseline,12,24.40,12.05%
+gpt-oss-20b-Q4_K_M,dspine-baseline,16,24.41,12.05%
+gpt-oss-20b-Q4_K_M,dspine-baseline,20,24.44,12.05%
+Qwen3.6-35B-A3B-UD-Q4_K_M,dspine-baseline,8,27.77,43.71%
+Qwen3.6-35B-A3B-UD-Q4_K_M,dspine-baseline,12,27.78,43.71%
+Qwen3.6-35B-A3B-UD-Q4_K_M,dspine-baseline,16,27.37,43.71%
+Qwen3.6-35B-A3B-UD-Q4_K_M,dspine-baseline,20,27.49,43.71%
+gpt-oss-20b-Q4_K_M,dspine-v2-custom,8,24.43,12.05%
+gpt-oss-20b-Q4_K_M,dspine-v2-custom,12,24.19,12.05%
+gpt-oss-20b-Q4_K_M,dspine-v2-custom,16,24.45,12.05%
+gpt-oss-20b-Q4_K_M,dspine-v2-custom,20,24.42,12.05%
+Qwen3.6-35B-A3B-UD-Q4_K_M,dspine-v2-custom,8,27.48,43.71%
+Qwen3.6-35B-A3B-UD-Q4_K_M,dspine-v2-custom,12,27.60,43.71%
+Qwen3.6-35B-A3B-UD-Q4_K_M,dspine-v2-custom,16,27.35,43.71%
+Qwen3.6-35B-A3B-UD-Q4_K_M,dspine-v2-custom,20,27.50,43.71%

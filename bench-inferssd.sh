@@ -67,9 +67,9 @@ MODEL_DIR="${MODEL_DIR:-${REPO_DIR}/models}"
 GPT_OSS_20B_PATH="${GPT_OSS_20B_GGUF:-${MODEL_DIR}/gpt-oss-20b-Q4_K_M.gguf}"
 QWEN_27B_A3B_PATH="${QWEN_27B_A3B_GGUF:-${MODEL_DIR}/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
 
-# Optional DSpine draft sidecar/model paths per target model
+# Optional DSpine/DFlash draft sidecar/model paths per target model
 GPT_OSS_DSPINE_DRAFT="${GPT_OSS_DSPINE_DRAFT_GGUF:-${MODEL_DIR}/gpt-oss-20b-dspine-draft-Q8_0.gguf}"
-QWEN_27B_DSPINE_DRAFT="${QWEN_27B_DSPINE_DRAFT_GGUF:-${MODEL_DIR}/Qwen3-27B-A3B-dspine-draft-Q8_0.gguf}"
+QWEN_27B_DSPINE_DRAFT="${QWEN_27B_DSPINE_DRAFT_GGUF:-${MODEL_DIR}/qwen36-35b-a3b-dflash-Q8_0.gguf}"
 
 MODELS=(
     "$GPT_OSS_20B_PATH"
@@ -139,30 +139,42 @@ run_inference_and_parse() {
     local spec_bin="${bin_dir}/llama-speculative"
 
     # Note: Do NOT pass --n-cpu-moe; custom V2 backend handles MoE routing natively
-    if [[ "$branch" == dspine-* ]]; then
-        local draft_path
-        draft_path="$(resolve_draft_model "$model_path")"
-        local draft_args=()
-        if [[ -f "$draft_path" ]]; then
-            draft_args=(-md "$draft_path" --draft-max "$block_size" --draft-min 1)
+    local attempt=1
+    while (( attempt <= 2 )); do
+        if [[ "$branch" == dspine-* ]]; then
+            local draft_path
+            draft_path="$(resolve_draft_model "$model_path")"
+            local draft_args=()
+            if [[ -f "$draft_path" ]]; then
+                draft_args=(-md "$draft_path" -ngld 999 --spec-draft-n-max "$block_size" --spec-draft-n-min 1 -lv 5)
+            else
+                draft_args=(--spec-type ngram-simple --spec-draft-n-max "$block_size" --spec-draft-n-min 1 -lv 5)
+            fi
+
+            if [[ -x "$spec_bin" && -f "$draft_path" ]]; then
+                "$spec_bin" -m "$model_path" "${draft_args[@]}" \
+                    -fit off -lm none -fa on -ub 64 -b 512 -t 12 \
+                    -p "$SYNTHETIC_PROMPT" -n "$GEN_TOKENS" --temp 0.0 --seed 42 -ngl 999 -c 4096 \
+                    >"$log_file" 2>&1 || true
+            else
+                "$cli_bin" -m "$model_path" "${draft_args[@]}" \
+                    -fit off -lm none -fa on -ub 64 -b 512 -t 12 \
+                    -p "$SYNTHETIC_PROMPT" -n "$GEN_TOKENS" --temp 0.0 --seed 42 -ngl 999 -c 4096 --single-turn \
+                    >"$log_file" 2>&1 || true
+            fi
         else
-            draft_args=(--draft-max "$block_size" --draft-min 1)
+            "$cli_bin" -m "$model_path" \
+                -fit off -lm none -fa on -ub 64 -b 512 -t 12 \
+                -p "$SYNTHETIC_PROMPT" -n "$GEN_TOKENS" --temp 0.0 --seed 42 -ngl 999 -c 4096 --single-turn \
+                >"$log_file" 2>&1 || true
         fi
 
-        if [[ -x "$spec_bin" && -f "$draft_path" ]]; then
-            "$spec_bin" -m "$model_path" "${draft_args[@]}" \
-                -p "$SYNTHETIC_PROMPT" -n "$GEN_TOKENS" --temp 0.0 -ngl 999 -c 4096 \
-                >"$log_file" 2>&1 || true
-        else
-            "$cli_bin" -m "$model_path" "${draft_args[@]}" \
-                -p "$SYNTHETIC_PROMPT" -n "$GEN_TOKENS" --temp 0.0 -ngl 999 -c 4096 --single-turn \
-                >"$log_file" 2>&1 || true
+        if ! grep -q "ROCm error" "$log_file" 2>/dev/null; then
+            break
         fi
-    else
-        "$cli_bin" -m "$model_path" \
-            -p "$SYNTHETIC_PROMPT" -n "$GEN_TOKENS" --temp 0.0 -ngl 999 -c 4096 --single-turn \
-            >"$log_file" 2>&1 || true
-    fi
+        sleep 6
+        (( ++attempt ))
+    done
 
     python3 - "$log_file" "$branch" <<'PY'
 import re, sys
@@ -189,8 +201,16 @@ for pat in patterns:
 # Parse draft acceptance rate for dspine branches
 acc_rate = "N/A"
 if branch.startswith("dspine-"):
+    json_drafts = re.findall(r'"draft_n"\s*:\s*(\d+)\s*,\s*"draft_n_accepted"\s*:\s*(\d+)', text)
+    spec_stats = re.findall(r"#gen tokens\s*=\s*(\d+),\s*#acc tokens\s*=\s*(\d+)", text)
     acc_matches = re.findall(r"(?:accept(?:ance|ed)?(?:\s+rate)?|f_acc)\s*[:=]\s*([\d.]+)\s*%?", text, flags=re.IGNORECASE)
-    if acc_matches:
+    if json_drafts and int(json_drafts[-1][0]) > 0:
+        d_n, d_acc = int(json_drafts[-1][0]), int(json_drafts[-1][1])
+        acc_rate = f"{(100.0 * d_acc / d_n):.2f}%"
+    elif spec_stats and int(spec_stats[-1][0]) > 0:
+        gen_t, acc_t = int(spec_stats[-1][0]), int(spec_stats[-1][1])
+        acc_rate = f"{(100.0 * acc_t / gen_t):.2f}%"
+    elif acc_matches:
         val = float(acc_matches[-1])
         if val <= 1.0 and "%" not in text[text.find(acc_matches[-1]):text.find(acc_matches[-1]) + 12]:
             val *= 100.0
@@ -218,18 +238,26 @@ for branch in "${BRANCHES[@]}"; do
 
     BDIR="${BUILD_ROOT}/${branch}"
     BIN_DIR="${BDIR}/bin"
-    mkdir -p "$BDIR"
+    mkdir -p "${BDIR}/tools/ui"
+    if [[ -d "/tmp/llama-apu-asan-builds/v2-custom/tools/ui/dist" && ! -f "${BDIR}/tools/ui/dist/workbox-b3c04f83.js" ]]; then
+        rm -rf "${BDIR}/tools/ui/dist"
+        cp -a "/tmp/llama-apu-asan-builds/v2-custom/tools/ui/dist" "${BDIR}/tools/ui/dist"
+    fi
 
-    cmake -S . -B "$BDIR" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DGGML_HIP=ON \
-        -DCMAKE_HIP_ARCHITECTURES="$GPU_TARGET" \
-        -DAMDGPU_TARGETS="$GPU_TARGET" \
-        -DGPU_TARGETS="$GPU_TARGET" \
-        >"${BDIR}/cmake-config.log" 2>&1
+    if [[ -x "${BIN_DIR}/llama-cli" ]]; then
+        echo "  -> Reusing existing Release build in ${BIN_DIR}/llama-cli"
+    else
+        cmake -S . -B "$BDIR" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_HIP=ON \
+            -DCMAKE_HIP_ARCHITECTURES="$GPU_TARGET" \
+            -DAMDGPU_TARGETS="$GPU_TARGET" \
+            -DGPU_TARGETS="$GPU_TARGET" \
+            >"${BDIR}/cmake-config.log" 2>&1
 
-    cmake --build "$BDIR" --target llama-cli -j"$(nproc)" \
-        >"${BDIR}/cmake-build.log" 2>&1
+        cmake --build "$BDIR" --target llama-cli -j"$(nproc)" \
+            2>&1 | tee "${BDIR}/cmake-build.log"
+    fi
 
     for model_path in "${MODELS[@]}"; do
         model_name="$(basename "$model_path" .gguf)"
@@ -250,7 +278,7 @@ for branch in "${BRANCHES[@]}"; do
         if [[ "$branch" == dspine-* ]]; then
             # Drafting Logic: loop through draft block sizes 8, 12, 16, and 20
             for bsize in "${DRAFT_BLOCK_SIZES[@]}"; do
-                sleep 2
+                sleep 4
                 echo "     [Run] branch=${branch} model=${model_name} draft_block_size=${bsize}..."
                 log_file="${BDIR}/run-${model_name}-b${bsize}.log"
                 metrics="$(run_inference_and_parse "$BIN_DIR" "$model_path" "$branch" "$bsize" "$log_file")"
@@ -261,7 +289,7 @@ for branch in "${BRANCHES[@]}"; do
             done
         else
             # Standard non-drafting inference
-            sleep 2
+            sleep 4
             echo "     [Run] branch=${branch} model=${model_name} (non-drafting)..."
             log_file="${BDIR}/run-${model_name}-standard.log"
             metrics="$(run_inference_and_parse "$BIN_DIR" "$model_path" "$branch" "N/A" "$log_file")"

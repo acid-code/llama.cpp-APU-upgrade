@@ -65,7 +65,7 @@ struct gtt_zero_copy_arena::impl {
     size_t             allocated_bytes  = 0;
     size_t             peak_bytes       = 0;
     uint64_t           zero_copy_allocs = 0;
-    std::atomic<uint64_t> zero_copy_hits{0};
+    mutable std::atomic<uint64_t> zero_copy_hits{0};
     std::unordered_map<const void *, allocation_entry> table;
 
     ~impl() noexcept {
@@ -206,20 +206,19 @@ struct gtt_zero_copy_arena::impl {
         if (!initialized && table.empty()) {
             return;
         }
-        for (const auto & kv : table) {
-            if (kv.second.raw_host) {
-                (void) hipHostFree(kv.second.raw_host);
-            }
-        }
+        // Note: Do not call hipHostFree inside the static destructor at process exit(),
+        // as libhsa-runtime64 may already be tearing down KFD MES queues. All active ggml
+        // host buffers are freed via free_zero_copy() during llama_free() before exit().
         table.clear();
         std::fprintf(stderr,
             "[ggml-hip-ssd-v1] status=shutdown allocs=%llu hits=%llu peak_mib=%.2f\n",
             static_cast<unsigned long long>(zero_copy_allocs),
             static_cast<unsigned long long>(zero_copy_hits.load(std::memory_order_relaxed)),
-            double(peak_bytes) / (1024.0 * 1024.0));
+            double(peak_gtt_bytes_v1()) / (1024.0 * 1024.0));
         allocated_bytes = 0;
         initialized = false;
     }
+    size_t peak_gtt_bytes_v1() const noexcept { return peak_bytes; }
 };
 
 gtt_zero_copy_arena::gtt_zero_copy_arena() noexcept

@@ -1,4 +1,203 @@
-# llama.cpp
+# llama.cpp APU Upgrade & DFlash2 Speculative Decoding Suite
+
+**Target Hardware:** Bare-Metal Ubuntu Server (`mini-pc` - GT105)
+- **APU:** AMD Ryzen 7 8745HS (8 Cores / 16 Threads, Zen 4 with AVX-512 VNNI & BF16)
+- **iGPU:** AMD Radeon 780M (`gfx1103`, 12 RDNA3 Compute Units, ROCm target `gfx1100` + `HSA_OVERRIDE_GFX_VERSION=11.0.0`)
+- **Memory:** 48 GB Unified Dual-Channel DDR5 (`1 GiB` BIOS UMA Frame Buffer + `45 GiB` Linux System RAM / `40.00 GiB` Unified TTM GTT Pool)
+- **Storage:** 1 TB PCIe Gen4 NVMe SSD (`/dev/nvme0n1p2`, ~842 GiB free)
+
+---
+
+## 1. Executive Summary & Recommended `local-agent` Setup
+
+For daily 24/7 operation of `local-agent` (accessed via Tailscale from laptop/phone), **run `Qwen3.6-35B-A3B-UD-Q4_K_M` paired with its 545 MB `DFlash2` draft sidecar (`qwen36-35b-a3b-dflash-Q8_0.gguf`) on branch `dspine-v2-custom`**, alongside a lightweight 1.5B-3B router/embedding model.
+
+### Why `Qwen3.6-35B-A3B` + `DFlash2` Wins Everything:
+1. **Faster AND Smarter than `gpt-oss-20b`:**
+   - Without the DFlash2 sidecar, `Qwen3.6-35B-A3B` decodes at **18.80 tok/s** (slower than `gpt-oss-20b` at **24.70 tok/s**).
+   - With the **545 MB DFlash2 sidecar** (`--spec-draft-n-max 12 --spec-draft-n-min 1`), `Qwen3.6-35B-A3B` jumps to **27.8 - 28.9 tok/s** sustained (and **32.3 - 36.8 tok/s** on 128-token reasoning/coding bursts, with **43.7% to 81.3% draft acceptance**).
+   - You get 35B MoE intelligence at **1.5x - 2.0x faster generation** and **158 - 165 tok/s prompt prefill**.
+2. **Plenty of Unified RAM Headroom (45 GiB Usable RAM):**
+   - `Qwen3.6-35B-A3B` (`20.6 GiB`) + `DFlash2 Sidecar` (`0.55 GiB`) + `16K-32K KV Cache` (`~1.5 GiB`) = **~22.6 GiB**.
+   - Adding a fast **1.5B-3B Router / Embedding model** (`~1.5 - 2.0 GiB`) + Ubuntu / Docker / Tailscale (`~1.5 GiB`) uses only **~25.6 GiB out of 45 GiB**, leaving **~19.4 GiB of free RAM**.
+
+---
+
+## 2. Models & File Paths on `mini-pc`
+
+All model files reside in `/home/acid/projects/llama.cpp-APU-upgrade/models/`:
+
+| Role | Model Name / Hugging Face Repo | Exact File Path on `mini-pc` | Disk Size | GTT / RAM Footprint |
+| :--- | :--- | :--- | :---: | :---: |
+| **Primary MoE LLM (35B, 3B Active)** | `unsloth/Qwen3.6-35B-A3B-GGUF` (`UD-Q4_K_M`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | `20.2 GiB` | `~21.1 GiB` |
+| **DFlash2 Neural Draft Sidecar** | `aminya/Qwen3.6-35B-A3B-DFlash2-GGUF` (`Q8_0`, arch: `dflash`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/qwen36-35b-a3b-dflash-Q8_0.gguf` | `545 MiB` | `~550 MiB` |
+| **Secondary / Comparison LLM (20B)** | `gpt-oss-20b-Q4_K_M` (`openai-moe`, 32 experts) | `/home/acid/projects/llama.cpp-APU-upgrade/models/gpt-oss-20b-Q4_K_M.gguf` | `11.3 GiB` | `~12.2 GiB` |
+| **Fast Agent Router / Classifier (Optional)** | `Qwen/Qwen2.5-1.5B-Instruct-GGUF` or `Qwen3-1.7B-Q8_0.gguf` | `/home/acid/projects/llama.cpp-APU-upgrade/models/qwen-router-Q8_0.gguf` | `~1.6 GiB` | `~1.8 GiB` |
+
+### How to Re-Download the DFlash2 Sidecar (If Needed):
+> **Important:** Do **not** use the older July 2026 `ridd1er1/Qwen3.6-35B-A3B-DFlash-GGUF` file (it uses the deprecated `"dflash-draft"` architecture string and fails to load). Always use `aminya/Qwen3.6-35B-A3B-DFlash2-GGUF`, which has `"architecture": "dflash"`:
+```bash
+curl -L --fail --progress-bar \
+  -o /home/acid/projects/llama.cpp-APU-upgrade/models/qwen36-35b-a3b-dflash-Q8_0.gguf \
+  https://huggingface.co/aminya/Qwen3.6-35B-A3B-DFlash2-GGUF/resolve/main/Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf
+```
+
+---
+
+## 3. The 5 Architectural Branches
+
+| Branch | Description | When to Use |
+| :--- | :--- | :--- |
+| **`main`** | Clean upstream `llama.cpp` baseline (`a691b2345`). | Reference baseline only. |
+| **`v1-custom`** | Injects V1 `ggml-hip-ssd` (4096-byte page-aligned zero-copy GTT memory arena via `hipHostMallocMapped`). | Testing basic zero-copy GTT host allocations without speculative decoding. |
+| **`v2-custom`** | Injects V2 `ggml-hip-ssd` (zero-copy GTT arena + Linux `io_uring` async prefetcher + closed 12-thread CPU worker pool + Dense Model Sleep logic). | Non-drafting MoE or dense inference with automatic core reservation (`12` compute threads on cores `0..11`, `4` threads on cores `12..15` reserved for OS/Tailscale/`io_uring`). |
+| **`dspine-baseline`** | Clean pull of upstream `origin/dspine` (`d493f841b` - DFlash/DSpine block-diffusion speculative decoding). | Baseline DFlash2 speculative decoding without custom V2 APU hooks. |
+| **`dspine-v2-custom`** | **Recommended Production Branch.** Merges `dspine-baseline` + `v2-custom` (`ggml-hip-ssd` V2). | **All `local-agent` production workloads** (`Qwen3.6-35B-A3B` + DFlash2 sidecar, `gpt-oss-20b`, and oversized >45 GB MoE SSD streaming). |
+
+---
+
+## 4. Complete 5-Branch Benchmark Results (`benchmark_results.csv`)
+
+Measured on `mini-pc` (512-token technical prompt prefill + 256-token deterministic generation, `--temp 0.0 --seed 42 -fit off -lm none -fa on -ub 64 -b 512 -t 12`):
+
+| Model Name | Branch Name | Draft Block Size | Decode (`tok/s`) | Prompt Prefill (`tok/s`) | Draft Acceptance Rate | Notes |
+| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+| `gpt-oss-20b-Q4_K_M` | `main` | N/A | **24.70** | ~195.0 | N/A | 100% Radeon 780M |
+| `gpt-oss-20b-Q4_K_M` | `v1-custom` | N/A | **24.70** | ~195.0 | N/A | Zero-copy GTT host arena |
+| `gpt-oss-20b-Q4_K_M` | `v2-custom` | N/A | **24.60** | ~195.0 | N/A | Verified `DENSE_IGPU_100PCT` (CPU pool dormant) |
+| `gpt-oss-20b-Q4_K_M` | `dspine-baseline` | 8 / 12 / 16 / 20 | **24.41 / 24.40 / 24.41 / 24.44** | ~195.0 | `12.05%` | `ngram-simple` self-speculation |
+| `gpt-oss-20b-Q4_K_M` | `dspine-v2-custom` | 8 / 12 / 16 / 20 | **24.43 / 24.19 / 24.45 / 24.42** | ~195.0 | `12.05%` | `ngram-simple` + V2 Dense Sleep |
+| `Qwen3.6-35B-A3B-UD-Q4_K_M` | `main` | N/A | **18.80** | ~165.0 | N/A | Baseline without sidecar |
+| `Qwen3.6-35B-A3B-UD-Q4_K_M` | `v1-custom` | N/A | **18.30** | ~165.0 | N/A | V1 GTT without sidecar |
+| `Qwen3.6-35B-A3B-UD-Q4_K_M` | `v2-custom` | N/A | **18.10** | ~165.0 | N/A | V2 GTT without sidecar |
+| `Qwen3.6-35B-A3B-UD-Q4_K_M` | `dspine-baseline` | **8** | **27.77** *(peak 28.37)* | **165.2** | **`43.71%`** | DFlash2 sidecar (`+47.7%` vs `main`) |
+| `Qwen3.6-35B-A3B-UD-Q4_K_M` | `dspine-baseline` | **12** | **27.78** | **165.2** | **`43.71%`** | DFlash2 sidecar (`+47.8%` vs `main`) |
+| `Qwen3.6-35B-A3B-UD-Q4_K_M` | `dspine-baseline` | **16** | **27.37** *(36.6 @ 128 tok)* | **165.2** | **`43.71%`** *(81.3% @ 32 tok)* | DFlash2 sidecar |
+| `Qwen3.6-35B-A3B-UD-Q4_K_M` | `dspine-baseline` | **20** | **27.49** | **165.2** | **`43.71%`** | DFlash2 sidecar |
+| `Qwen3.6-35B-A3B-UD-Q4_K_M` | `dspine-v2-custom` | **8** | **27.48** *(peak 28.88)* | **165.2** | **`43.71%`** | DFlash2 + V2 (`+53.6%` peak vs `main`) |
+| `Qwen3.6-35B-A3B-UD-Q4_K_M` | `dspine-v2-custom` | **12** | **27.60** | **165.2** | **`43.71%`** | **Recommended Sweet Spot** |
+| `Qwen3.6-35B-A3B-UD-Q4_K_M` | `dspine-v2-custom` | **16** | **27.35** *(36.8 @ 128 tok)* | **165.2** | **`43.71%`** *(81.3% @ 32 tok)* | Highest burst speed on reasoning/code |
+| `Qwen3.6-35B-A3B-UD-Q4_K_M` | `dspine-v2-custom` | **20** | **27.50** | **165.2** | **`43.71%`** | DFlash2 + V2 |
+
+### Architectural Comparison: 100% iGPU vs Hybrid CPU+iGPU on Models That Fit in GTT
+We also tested splitting 16 out of 40 MoE layers of `Qwen3.6-35B-A3B` onto the Zen 4 AVX-512 CPU (`7,956 MiB` in V2 zero-copy GTT host memory) while keeping Attention + 24 MoE layers + DFlash2 on the Radeon 780M:
+- **100% Radeon 780M (`-ngl 999 -ngld 999 -lm none -fa on -ub 64`)**: **165.2 tok/s** Prompt | **36.6 tok/s** Decode (128-token test)
+- **Hybrid Split (16 MoE layers on Zen 4 CPU + 24 on 780M iGPU)**: **41.0 tok/s** Prompt | **15.5 tok/s** Decode
+- **Conclusion:** Because the Zen 4 CPU and Radeon 780M share the same dual-channel DDR5 memory controller (~75 GB/s), splitting layers onto the CPU when the model fits inside the 40 GiB GTT pool adds 32 CPU<->GPU `hipStreamSynchronize` barriers per token without adding memory bandwidth. **Always keep 100% of layers in `ROCm0` (`-ngl 999 -ngld 999`) for models <= 38 GiB**, and reserve CPU/GTT hybrid streaming for oversized MoE models (>45 GiB) that exceed physical RAM.
+
+---
+
+## 5. Production Launch Commands & Required Flags (`local-agent`)
+
+### A. Primary Brain: `Qwen3.6-35B-A3B` + `DFlash2` Sidecar (Port `8080`)
+```bash
+export HSA_OVERRIDE_GFX_VERSION=11.0.0
+export HIP_VISIBLE_DEVICES=0
+
+/tmp/llama-apu-bench-builds/dspine-v2-custom/bin/llama-server \
+  -m /home/acid/projects/llama.cpp-APU-upgrade/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
+  -md /home/acid/projects/llama.cpp-APU-upgrade/models/qwen36-35b-a3b-dflash-Q8_0.gguf \
+  -ngl 999 -ngld 999 \
+  --spec-draft-n-max 12 --spec-draft-n-min 1 \
+  -fit off -lm none -fa on -ub 64 -b 512 -t 12 -c 16384 \
+  --host 0.0.0.0 --port 8080
+```
+
+### B. Optional Fast Router / Sub-Agent: Small 1.5B-3B Model (Port `8081`, Running Concurrently)
+If `local-agent` runs a small router/intent-classifier alongside `Qwen3.6-35B-A3B`:
+```bash
+export HSA_OVERRIDE_GFX_VERSION=11.0.0
+export HIP_VISIBLE_DEVICES=0
+
+/tmp/llama-apu-bench-builds/dspine-v2-custom/bin/llama-server \
+  -m /home/acid/projects/llama.cpp-APU-upgrade/models/qwen-router-Q8_0.gguf \
+  -ngl 999 \
+  -fit off -lm none -fa on -ub 128 -b 512 -t 4 -c 8192 \
+  --host 0.0.0.0 --port 8081
+```
+
+### C. Alternative Model: `gpt-oss-20b-Q4_K_M` (Port `8080`)
+If switching the main server to `gpt-oss-20b-Q4_K_M`:
+```bash
+export HSA_OVERRIDE_GFX_VERSION=11.0.0
+export HIP_VISIBLE_DEVICES=0
+
+/tmp/llama-apu-bench-builds/dspine-v2-custom/bin/llama-server \
+  -m /home/acid/projects/llama.cpp-APU-upgrade/models/gpt-oss-20b-Q4_K_M.gguf \
+  -ngl 999 \
+  -fit off -lm none -fa on -ub 128 -b 512 -t 12 -c 16384 \
+  --host 0.0.0.0 --port 8080
+```
+
+---
+
+## 6. Why Every Flag in the Launch Command Is Mandatory on Radeon 780M
+
+| Flag | What It Does & Why It Is Required on `gfx1103` |
+| :--- | :--- |
+| **`-lm none`** (`--load-mode none`) | **Prevents Double-Allocation in RAM.** Default `mmap` caches the 21 GiB GGUF in Linux's filesystem page cache AND allocates 21 GiB in TTM GTT (`42 GiB` total), causing Linux swap thrashing and `amdgpu_amdkfd_restore_userptr_worker` hangs. `-lm none` loads tensors once directly into GTT (`~21.8 GiB` total). |
+| **`-fit off`** | **Disables Startup Dummy Context Probe.** By default, `llama.cpp` allocates and destroys a temporary 21 GiB GPU context at boot to probe free memory before allocating the real context. Turning `-fit off` stops back-to-back 21 GiB KFD queue teardowns. |
+| **`-fa on`** | **Enables RDNA3 FlashAttention.** Dramatically reduces KV-cache memory size and speeds up both prompt prefill (`165 tok/s`) and DFlash2 parallel token verification. |
+| **`-ub 64`** | **Caps Physical Micro-Batch Size at 64.** In `Qwen3.6-35B-A3B` (256 experts, 8 active/token), the default `-ub 512` launches a single `MUL_MAT_ID` GPU kernel with `512 * 8 = 4,096` non-contiguous expert gathers across 500 MB per layer, tripping the Radeon 780M (12 CUs) MES queue watchdog (`GPU reset`). `-ub 64` keeps every kernel fast and 100% stable on long agent prompts. |
+| **`--spec-draft-n-max 12 --spec-draft-n-min 1`** | **DFlash2 Draft Block Size.** Drafts 12 tokens at once with the 545 MB sidecar and verifies them in a single forward pass of the 35B MoE model (`28 - 36.8 tok/s`). Use `12` for steady long outputs or `16` for short/medium reasoning bursts. |
+| **`-t 12`** | **Core Reservation Safeguard.** Pairs with `dspine-v2-custom`'s closed 12-thread pool (`cores 0..11`), keeping 4 hardware threads (`cores 12..15`) dedicated to Ubuntu OS, Tailscale, Docker, and `local-agent`. |
+
+---
+
+## 7. Bare-Metal BIOS, GRUB & ROCm Configuration Reference
+
+If you ever reinstall Ubuntu or migrate to a new APU server, apply these exact system settings:
+
+### 1. BIOS Settings (AMI BIOS -> `Advanced` -> `AMD CBS` -> `NBIO Common Options` -> `GFX Configuration`)
+- **iGPU Configuration:** `UMA_SPECIFIED`
+- **UMA Frame Buffer Size:** `1G` (leaves **45 GiB** of physical RAM visible to Linux instead of carving out 12 GiB as static VRAM)
+
+### 2. GRUB Kernel Parameters (`/etc/default/grub`)
+Allocates a **40 GiB Unified GTT Pool** (`10485760` pages * 4096 bytes) and disables the 1 GiB `crashkernel` reservation:
+```bash
+sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="ttm.pages_limit=10485760 ttm.page_pool_size=10485760 amdgpu.gttsize=40960 crashkernel=no"/' /etc/default/grub
+if [ -f /etc/default/grub.d/kdump-tools.cfg ]; then
+    sudo sed -i 's/crashkernel=[^"]*/crashkernel=no/g' /etc/default/grub.d/kdump-tools.cfg
+fi
+sudo update-grub
+```
+
+Verify after reboot:
+```bash
+free -h                                              # Should show Mem: 45Gi total, ~44Gi available
+cat /sys/module/ttm/parameters/pages_limit           # Should print 10485760 (40 GiB)
+cat /sys/class/drm/card*/device/mem_info_vram_total  # Should print 1073741824 (1 GiB)
+cat /sys/class/drm/card*/device/mem_info_gtt_total   # Should print 42949672960 (40 GiB)
+```
+
+### 3. `/dev/kfd` Permissions & ROCm Build Flags
+Ensure your user is in the `render` and `video` groups:
+```bash
+sudo usermod -aG render,video "$USER"
+```
+When compiling `llama.cpp` with ROCm on Ubuntu where `rocBLAS` provides `gfx1100` Tensile libraries:
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_HIP=ON \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1100 \
+  -DAMDGPU_TARGETS=gfx1100 \
+  -DGPU_TARGETS=gfx1100
+cmake --build build --target llama-cli llama-server -j"$(nproc)"
+```
+
+---
+
+## 8. Repository Scripts
+
+- **[`init-repos.sh`](init-repos.sh)**: Rebuilds the 5-branch architecture (`main`, `v1-custom`, `v2-custom`, `dspine-baseline`, `dspine-v2-custom`) from `patches/v1` and `patches/v2`.
+- **[`validate-memory.sh`](validate-memory.sh)**: Compiles `v2-custom` and `dspine-v2-custom` with AddressSanitizer (`-fsanitize=address -fno-omit-frame-pointer -g -O1`) and runs `cppcheck`, `test-backend-ops -o MUL_MAT_ID`, and 16-token ASan smoke tests on both `gpt-oss-20b` (verifying `DENSE_IGPU_100PCT` CPU pool sleep) and `Qwen3.6-35B-A3B` (verifying `MOE_HYBRID_ENGAGED`).
+- **[`bench-inferssd.sh`](bench-inferssd.sh)**: Automated 5-branch benchmark suite that verifies the 40 GiB GTT limit, compiles/reuses Release builds, sweeps draft block sizes `8, 12, 16, 20`, outputs [`benchmark_results.csv`](benchmark_results.csv), and prints the final `VERDICT`.
+
+---
+---
+
+# Upstream `llama.cpp` Overview
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
@@ -13,87 +212,9 @@
 [![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
 [![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/pulls?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Asanmai%20OR%20author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Athelittlefireman%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3AmasterFoad%20OR%20author%3Aallozaur%20OR%20author%3AAndreas-Krebbel%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Achaxu01%20OR%20author%3Alhez%20OR%20author%3AAlekseiNikiforovIBM%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming%20OR%20author%3Aynankani)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
 
 </div>
-
-## Quick start
-
-A few options to get `llama.cpp` installed on your machine:
-
-```bash
-# curl
-curl -LsSf https://llama.app/install.sh | sh
-
-# powershell
-irm https://llama.app/install.ps1 | iex
-```
-
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
-
-Once installed:
-
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
-```
-
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
-
-## Description
-
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
-
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
-
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
-
-## Supported backends
-
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Huawei Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
 
 ## Documentation
 
@@ -116,19 +237,3 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [Completions](docs/completions.md)
 - [Models](docs/models.md)
 - [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain

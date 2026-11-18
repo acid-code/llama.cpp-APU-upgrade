@@ -85,6 +85,13 @@ We also tested splitting 16 out of 40 MoE layers of `Qwen3.6-35B-A3B` onto the Z
 - **Hybrid Split (16 MoE layers on Zen 4 CPU + 24 on 780M iGPU)**: **41.0 tok/s** Prompt | **15.5 tok/s** Decode
 - **Conclusion:** Because the Zen 4 CPU and Radeon 780M share the same dual-channel DDR5 memory controller (~75 GB/s), splitting layers onto the CPU when the model fits inside the 40 GiB GTT pool adds 32 CPU<->GPU `hipStreamSynchronize` barriers per token without adding memory bandwidth. **Always keep 100% of layers in `ROCm0` (`-ngl 999 -ngld 999`) for models <= 38 GiB**, and reserve CPU/GTT hybrid streaming for oversized MoE models (>45 GiB) that exceed physical RAM.
 
+### Oversized Out-of-Core SSD Offloading Test: `GLM-4.5-Air-UD-IQ3_XXS` (106B-A12B, 47.9 GiB)
+We also benchmarked an oversized MoE model larger than the 45 GiB system RAM (`GLM-4.5-Air-UD-IQ3_XXS`, `47.9 GiB` on NVMe SSD) using `-ngl 0 -lm mmap -fit off -ub 64 -b 64 -t 12 -c 2048` (`HIP_VISIBLE_DEVICES=-1`):
+- **Prompt Prefill (512 tokens):** **13.1 tok/s**
+- **Generation / Decode (128 tokens):** **3.6 tok/s**
+- **Peak RSS & Real SSD I/O:** `43.59 GiB` RSS, `850,627` major page faults (`~83.3 GiB` streamed from NVMe SSD across the run)
+- **Takeaway for `local-agent`:** Running >45 GiB models from SSD works cleanly without crashing, **but** at `3.6 tok/s` decode / `13.1 tok/s` prefill (8x-12x slower than `Qwen3.6-35B-A3B` + `DFlash2`). Only use >45 GiB SSD-offloaded models for rare offline/overnight deep-research jobs, **not** interactive `local-agent` coding or tool loops.
+
 ---
 
 ## 5. Production Launch Commands & Required Flags (`local-agent`)
@@ -94,7 +101,7 @@ We also tested splitting 16 out of 40 MoE layers of `Qwen3.6-35B-A3B` onto the Z
 export HSA_OVERRIDE_GFX_VERSION=11.0.0
 export HIP_VISIBLE_DEVICES=0
 
-/tmp/llama-apu-bench-builds/dspine-v2-custom/bin/llama-server \
+/home/acid/projects/llama.cpp-APU-upgrade/build-dspine-v2/bin/llama-server \
   -m /home/acid/projects/llama.cpp-APU-upgrade/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
   -md /home/acid/projects/llama.cpp-APU-upgrade/models/qwen36-35b-a3b-dflash-Q8_0.gguf \
   -ngl 999 -ngld 999 \
@@ -109,7 +116,7 @@ If `local-agent` runs a small router/intent-classifier alongside `Qwen3.6-35B-A3
 export HSA_OVERRIDE_GFX_VERSION=11.0.0
 export HIP_VISIBLE_DEVICES=0
 
-/tmp/llama-apu-bench-builds/dspine-v2-custom/bin/llama-server \
+/home/acid/projects/llama.cpp-APU-upgrade/build-dspine-v2/bin/llama-server \
   -m /home/acid/projects/llama.cpp-APU-upgrade/models/qwen-router-Q8_0.gguf \
   -ngl 999 \
   -fit off -lm none -fa on -ub 128 -b 512 -t 4 -c 8192 \
@@ -122,7 +129,7 @@ If switching the main server to `gpt-oss-20b-Q4_K_M`:
 export HSA_OVERRIDE_GFX_VERSION=11.0.0
 export HIP_VISIBLE_DEVICES=0
 
-/tmp/llama-apu-bench-builds/dspine-v2-custom/bin/llama-server \
+/home/acid/projects/llama.cpp-APU-upgrade/build-dspine-v2/bin/llama-server \
   -m /home/acid/projects/llama.cpp-APU-upgrade/models/gpt-oss-20b-Q4_K_M.gguf \
   -ngl 999 \
   -fit off -lm none -fa on -ub 128 -b 512 -t 12 -c 16384 \

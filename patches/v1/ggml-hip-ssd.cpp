@@ -9,6 +9,7 @@
 #endif
 
 #include "ggml-hip-ssd.h"
+#include "ggml-impl.h"
 
 #if defined(__has_include)
 #  if __has_include(<hip/hip_runtime.h>)
@@ -65,7 +66,7 @@ struct gtt_zero_copy_arena::impl {
     size_t             allocated_bytes  = 0;
     size_t             peak_bytes       = 0;
     uint64_t           zero_copy_allocs = 0;
-    std::atomic<uint64_t> zero_copy_hits{0};
+    mutable std::atomic<uint64_t> zero_copy_hits{0};
     std::unordered_map<const void *, allocation_entry> table;
 
     ~impl() noexcept {

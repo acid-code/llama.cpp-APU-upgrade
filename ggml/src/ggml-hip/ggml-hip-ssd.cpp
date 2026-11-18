@@ -24,6 +24,7 @@
 #endif
 
 #include "ggml-hip-ssd.h"
+#include "ggml-impl.h"
 
 #if defined(__has_include)
 #  if __has_include(<hip/hip_runtime.h>)
@@ -370,7 +371,7 @@ struct apu_v2_engine::impl {
     size_t             gtt_arena_bytes  = 0;
     size_t             peak_gtt_bytes   = 0;
     uint64_t           zero_copy_allocs = 0;
-    std::atomic<uint64_t> zero_copy_hits{0};
+    mutable std::atomic<uint64_t> zero_copy_hits{0};
     std::unordered_map<const void *, gtt_allocation> allocations;
 
     // Hardware Safeguard #1 & #2: Routing mode & Custom Closed 12-Thread CPU Worker Pool

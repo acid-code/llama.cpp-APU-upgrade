@@ -370,7 +370,7 @@ struct apu_v2_engine::impl {
     size_t             gtt_arena_bytes  = 0;
     size_t             peak_gtt_bytes   = 0;
     uint64_t           zero_copy_allocs = 0;
-    std::atomic<uint64_t> zero_copy_hits{0};
+    mutable std::atomic<uint64_t> zero_copy_hits{0};
     std::unordered_map<const void *, gtt_allocation> allocations;
 
     // Hardware Safeguard #1 & #2: Routing mode & Custom Closed 12-Thread CPU Worker Pool
@@ -581,19 +581,22 @@ struct apu_v2_engine::impl {
             std::lock_guard<std::mutex> ulock(uring_mutex);
             if (uring_workers.empty() && !uring_stopping) {
                 const size_t total_slot_bytes = kDefaultGttPrefetchSlots * prefetch_slot_bytes;
-                {
-                    std::lock_guard<std::mutex> alock(mutex);
-                    if (!prefetch_arena_host) {
-                        prefetch_arena_host = alloc_zero_copy_locked(total_slot_bytes);
+                if (!prefetch_arena_host) {
+#if defined(__linux__)
+                    if (posix_memalign(&prefetch_arena_host, kGttPageAlignment, total_slot_bytes) != 0) {
+                        prefetch_arena_host = nullptr;
                     }
+#else
+                    prefetch_arena_host = std::malloc(total_slot_bytes);
+#endif
                 }
                 if (prefetch_arena_host) {
+                    std::memset(prefetch_arena_host, 0, total_slot_bytes);
                     char * host_base = static_cast<char *>(prefetch_arena_host);
-                    char * dev_base  = static_cast<char *>(resolve_device_ptr(prefetch_arena_host));
                     prefetch_slots.resize(kDefaultGttPrefetchSlots);
                     for (size_t i = 0; i < kDefaultGttPrefetchSlots; ++i) {
                         prefetch_slots[i].host_ptr = host_base + i * prefetch_slot_bytes;
-                        prefetch_slots[i].dev_ptr  = dev_base + i * prefetch_slot_bytes;
+                        prefetch_slots[i].dev_ptr  = host_base + i * prefetch_slot_bytes;
                         prefetch_slots[i].capacity = prefetch_slot_bytes;
                     }
                 }
@@ -750,13 +753,15 @@ struct apu_v2_engine::impl {
         if (!cgraph) {
             return routing_mode.load(std::memory_order_acquire);
         }
+        auto * mutable_graph         = const_cast<ggml_cgraph *>(cgraph);
+        const int n_nodes            = ggml_graph_n_nodes(mutable_graph);
         int32_t detected_experts     = 0;
         int32_t detected_expert_used = 0;
         int32_t mul_mat_id_nodes     = 0;
         bool    has_openai_swiglu    = false;
 
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
-            const ggml_tensor * node = cgraph->nodes[i];
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor * node = ggml_graph_node(mutable_graph, i);
             if (!node) {
                 continue;
             }
@@ -771,10 +776,10 @@ struct apu_v2_engine::impl {
         }
 
         if (has_openai_swiglu) {
-            return classify_model("gpt-oss-20b", detected_experts, detected_expert_used, cgraph->n_nodes);
+            return classify_model("gpt-oss-20b", detected_experts, detected_expert_used, n_nodes);
         }
         if (mul_mat_id_nodes == 0) {
-            return classify_model(model_hint ? model_hint : "dense-graph", 0, 0, cgraph->n_nodes);
+            return classify_model(model_hint ? model_hint : "dense-graph", 0, 0, n_nodes);
         }
         return classify_model(model_hint ? model_hint : "moe-graph", detected_experts, detected_expert_used, mul_mat_id_nodes);
     }
@@ -928,16 +933,18 @@ struct apu_v2_engine::impl {
         }
 
         std::lock_guard<std::mutex> lock(mutex);
-        if (!initialized && allocations.empty()) {
+        if (!initialized && allocations.empty() && !prefetch_arena_host) {
             return;
         }
-        for (const auto & kv : allocations) {
-            if (kv.second.raw_host) {
-                (void) hipHostFree(kv.second.raw_host);
-            }
-        }
+        // Note: Do not call hipHostFree inside the static destructor at process exit(),
+        // as libhsa-runtime64 may already be tearing down KFD MES queues (which causes
+        // remove_all_kfd_queues_mes MES queue hangs on gfx1103). All ggml host buffers
+        // are already freed via free_zero_copy() during llama_free() before exit().
         allocations.clear();
-        prefetch_arena_host = nullptr;
+        if (prefetch_arena_host) {
+            std::free(prefetch_arena_host);
+            prefetch_arena_host = nullptr;
+        }
         prefetch_slots.clear();
 
         std::fprintf(stderr,

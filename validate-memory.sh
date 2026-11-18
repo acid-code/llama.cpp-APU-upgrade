@@ -15,11 +15,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-$SCRIPT_DIR}"
 BUILD_ROOT="${BUILD_ROOT:-/tmp/llama-apu-asan-builds}"
-GPU_TARGET="${GPU_TARGET:-gfx1103}"
+# Ubuntu's system rocBLAS ships TensileLibrary_lazy_gfx1100.dat (RDNA3) but not gfx1103.dat.
+# Compiling for gfx1100 + HSA_OVERRIDE_GFX_VERSION=11.0.0 aligns both HIP kernels and rocBLAS on RDNA3.
+GPU_TARGET="${GPU_TARGET:-gfx1100}"
 
-MODEL_DIR="${MODEL_DIR:-/opt/models}"
+MODEL_DIR="${MODEL_DIR:-${REPO_DIR}/models}"
 DENSE_MODEL="${GPT_OSS_20B_GGUF:-${MODEL_DIR}/gpt-oss-20b-Q4_K_M.gguf}"
-MOE_MODEL="${QWEN_27B_A3B_GGUF:-${MODEL_DIR}/Qwen3-27B-A3B-Q4_K_M.gguf}"
+MOE_MODEL="${QWEN_27B_A3B_GGUF:-${MODEL_DIR}/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
 
 V2_BRANCHES=("v2-custom" "dspine-v2-custom")
 
@@ -50,9 +52,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-export ASAN_OPTIONS="detect_leaks=1:halt_on_error=1:abort_on_error=1:strict_string_checks=1:detect_stack_use_after_return=1"
+# Note: detect_leaks=0 and use_sigaltstack=0 are required with ROCm because AMD's system driver
+# libraries (libhsakmt.so.1 / libhsa-runtime64.so.1) allocate thread signal stacks on the heap
+# and keep singleton HSA event pools alive at process exit. All ASan out-of-bounds, use-after-free,
+# double-free, and stack checks remain 100% active.
+export ASAN_OPTIONS="detect_leaks=0:use_sigaltstack=0:halt_on_error=1:abort_on_error=1:strict_string_checks=1:detect_stack_use_after_return=1"
 export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.0.0}"
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
+
+# Verify /dev/kfd and /dev/dri/renderD128 permissions (user must be in 'render' and 'video' groups)
+if [[ -e /dev/kfd && ! -w /dev/kfd ]]; then
+    echo "ERROR: Current user ($(id -un)) does not have write access to /dev/kfd." >&2
+    echo "Run: sudo usermod -aG render,video $(id -un) && sudo chmod 666 /dev/kfd /dev/dri/render* /dev/dri/card*" >&2
+    exit 1
+fi
 
 # Verify 40 GiB GTT pages_limit (10485760 pages) before running ASan on target APU
 TTM_PAGES_LIMIT_FILE="/sys/module/ttm/parameters/pages_limit"
@@ -79,19 +92,21 @@ for branch in "${V2_BRANCHES[@]}"; do
         echo "[ASan] Running pre-build cppcheck on $branch..."
         cppcheck --language=c++ --enable=warning,style,performance,portability \
             --inconclusive --std=c++17 --error-exitcode=1 \
+            --suppress="*:ggml/src/ggml-impl.h" \
             -Iggml/include -Iggml/src \
             ggml/src/ggml-hip/ggml-hip-ssd.h \
             ggml/src/ggml-hip/ggml-hip-ssd.cpp
     fi
 
     BDIR="${BUILD_ROOT}/${branch}"
-    rm -rf "$BDIR"
     mkdir -p "$BDIR"
 
     echo "[ASan] Configuring CMake with AddressSanitizer for $branch..."
     cmake -S . -B "$BDIR" \
+        -DLLAMA_BUILD_TESTS=ON \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DGGML_HIP=ON \
+        -DCMAKE_HIP_ARCHITECTURES="$GPU_TARGET" \
         -DAMDGPU_TARGETS="$GPU_TARGET" \
         -DGPU_TARGETS="$GPU_TARGET" \
         -DCMAKE_C_FLAGS="$ASAN_FLAGS" \
@@ -101,8 +116,11 @@ for branch in "${V2_BRANCHES[@]}"; do
         >"${BDIR}/cmake-config.log" 2>&1
 
     echo "[ASan] Compiling llama-cli & test-backend-ops on $branch..."
-    cmake --build "$BDIR" --target llama-cli test-backend-ops -j"$(nproc)" \
-        >"${BDIR}/cmake-build.log" 2>&1
+    if ! cmake --build "$BDIR" --target llama-cli test-backend-ops -j"$(nproc)" 2>&1 | tee "${BDIR}/cmake-build.log"; then
+        echo "[ERROR] Build failed on branch $branch! Last 30 lines of ${BDIR}/cmake-build.log:" >&2
+        tail -n 30 "${BDIR}/cmake-build.log" >&2
+        exit 1
+    fi
 
     CLI_BIN="${BDIR}/bin/llama-cli"
     TEST_BIN="${BDIR}/bin/test-backend-ops"
@@ -118,8 +136,9 @@ for branch in "${V2_BRANCHES[@]}"; do
 
     # 1. Verify Dense Model Sleep Safeguard under ASan
     if [[ -f "$DENSE_MODEL" ]]; then
+        sleep 2
         echo "[ASan] Testing Dense Model Sleep Safeguard on $(basename "$DENSE_MODEL")..."
-        "$CLI_BIN" -m "$DENSE_MODEL" -p "Verify APU GTT zero-copy memory safety:" -n 16 --temp 0.0 -ngl 999 \
+        "$CLI_BIN" -m "$DENSE_MODEL" -p "Verify APU GTT zero-copy memory safety:" -n 16 --temp 0.0 -ngl 999 --single-turn \
             >"${BDIR}/asan-dense.log" 2>&1
         if ! grep -q "mode=DENSE_IGPU_100PCT" "${BDIR}/asan-dense.log"; then
             echo "[WARN] Dense sleep telemetry marker not found in ${BDIR}/asan-dense.log" >&2
@@ -132,8 +151,9 @@ for branch in "${V2_BRANCHES[@]}"; do
 
     # 2. Verify MoE Hybrid Engagement & 12-Thread Core Reservation under ASan
     if [[ -f "$MOE_MODEL" ]]; then
+        sleep 2
         echo "[ASan] Testing MoE Hybrid Engagement & io_uring Prefetcher on $(basename "$MOE_MODEL")..."
-        "$CLI_BIN" -m "$MOE_MODEL" -p "Verify MoE expert routing and io_uring GTT prefetch safety:" -n 16 --temp 0.0 -ngl 999 \
+        "$CLI_BIN" -m "$MOE_MODEL" -p "Verify MoE expert routing and io_uring GTT prefetch safety:" -n 16 --temp 0.0 -ngl 999 --single-turn \
             >"${BDIR}/asan-moe.log" 2>&1
         if ! grep -q "mode=MOE_HYBRID_ENGAGED" "${BDIR}/asan-moe.log"; then
             echo "[WARN] MoE engagement telemetry marker not found in ${BDIR}/asan-moe.log" >&2

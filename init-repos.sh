@@ -177,8 +177,9 @@ git checkout -B v1-custom main
 cp "$PATCH_STAGE/patches/v1/ggml-hip-ssd.h"   ggml/src/ggml-hip/ggml-hip-ssd.h
 cp "$PATCH_STAGE/patches/v1/ggml-hip-ssd.cpp" ggml/src/ggml-hip/ggml-hip-ssd.cpp
 cp -r "$PATCH_STAGE/patches" "$REPO_DIR/patches"
-for s in init-repos.sh validate-memory.sh bench-inferssd.sh; do
-    [[ -f "$PATCH_STAGE/$s" ]] && cp "$PATCH_STAGE/$s" "$REPO_DIR/$s" && chmod +x "$REPO_DIR/$s" && git add "$s"
+for s in init-repos.sh validate-memory.sh bench-inferssd.sh benchmark_results.csv; do
+    [[ -f "$PATCH_STAGE/$s" ]] && cp "$PATCH_STAGE/$s" "$REPO_DIR/$s" && chmod +x "$REPO_DIR/$s" 2>/dev/null || true
+    [[ -f "$REPO_DIR/$s" ]] && git add "$s"
 done
 inject_hip_ssd_cmake_and_hooks "v1"
 git add patches ggml/src/ggml-hip/ggml-hip-ssd.h ggml/src/ggml-hip/ggml-hip-ssd.cpp \
@@ -191,8 +192,9 @@ git checkout -B v2-custom main
 cp "$PATCH_STAGE/patches/v2/ggml-hip-ssd.h"   ggml/src/ggml-hip/ggml-hip-ssd.h
 cp "$PATCH_STAGE/patches/v2/ggml-hip-ssd.cpp" ggml/src/ggml-hip/ggml-hip-ssd.cpp
 cp -r "$PATCH_STAGE/patches" "$REPO_DIR/patches"
-for s in init-repos.sh validate-memory.sh bench-inferssd.sh; do
-    [[ -f "$PATCH_STAGE/$s" ]] && cp "$PATCH_STAGE/$s" "$REPO_DIR/$s" && chmod +x "$REPO_DIR/$s" && git add "$s"
+for s in init-repos.sh validate-memory.sh bench-inferssd.sh benchmark_results.csv; do
+    [[ -f "$PATCH_STAGE/$s" ]] && cp "$PATCH_STAGE/$s" "$REPO_DIR/$s" && chmod +x "$REPO_DIR/$s" 2>/dev/null || true
+    [[ -f "$REPO_DIR/$s" ]] && git add "$s"
 done
 inject_hip_ssd_cmake_and_hooks "v2"
 git add patches ggml/src/ggml-hip/ggml-hip-ssd.h ggml/src/ggml-hip/ggml-hip-ssd.cpp \

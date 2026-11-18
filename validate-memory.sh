@@ -17,9 +17,9 @@ REPO_DIR="${REPO_DIR:-$SCRIPT_DIR}"
 BUILD_ROOT="${BUILD_ROOT:-/tmp/llama-apu-asan-builds}"
 GPU_TARGET="${GPU_TARGET:-gfx1103}"
 
-MODEL_DIR="${MODEL_DIR:-/opt/models}"
+MODEL_DIR="${MODEL_DIR:-${REPO_DIR}/models}"
 DENSE_MODEL="${GPT_OSS_20B_GGUF:-${MODEL_DIR}/gpt-oss-20b-Q4_K_M.gguf}"
-MOE_MODEL="${QWEN_27B_A3B_GGUF:-${MODEL_DIR}/Qwen3-27B-A3B-Q4_K_M.gguf}"
+MOE_MODEL="${QWEN_27B_A3B_GGUF:-${MODEL_DIR}/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
 
 V2_BRANCHES=("v2-custom" "dspine-v2-custom")
 
@@ -79,17 +79,18 @@ for branch in "${V2_BRANCHES[@]}"; do
         echo "[ASan] Running pre-build cppcheck on $branch..."
         cppcheck --language=c++ --enable=warning,style,performance,portability \
             --inconclusive --std=c++17 --error-exitcode=1 \
+            --suppress="*:ggml/src/ggml-impl.h" \
             -Iggml/include -Iggml/src \
             ggml/src/ggml-hip/ggml-hip-ssd.h \
             ggml/src/ggml-hip/ggml-hip-ssd.cpp
     fi
 
     BDIR="${BUILD_ROOT}/${branch}"
-    rm -rf "$BDIR"
     mkdir -p "$BDIR"
 
     echo "[ASan] Configuring CMake with AddressSanitizer for $branch..."
     cmake -S . -B "$BDIR" \
+        -DLLAMA_BUILD_TESTS=ON \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DGGML_HIP=ON \
         -DAMDGPU_TARGETS="$GPU_TARGET" \
@@ -101,8 +102,11 @@ for branch in "${V2_BRANCHES[@]}"; do
         >"${BDIR}/cmake-config.log" 2>&1
 
     echo "[ASan] Compiling llama-cli & test-backend-ops on $branch..."
-    cmake --build "$BDIR" --target llama-cli test-backend-ops -j"$(nproc)" \
-        >"${BDIR}/cmake-build.log" 2>&1
+    if ! cmake --build "$BDIR" --target llama-cli test-backend-ops -j"$(nproc)" 2>&1 | tee "${BDIR}/cmake-build.log"; then
+        echo "[ERROR] Build failed on branch $branch! Last 30 lines of ${BDIR}/cmake-build.log:" >&2
+        tail -n 30 "${BDIR}/cmake-build.log" >&2
+        exit 1
+    fi
 
     CLI_BIN="${BDIR}/bin/llama-cli"
     TEST_BIN="${BDIR}/bin/test-backend-ops"

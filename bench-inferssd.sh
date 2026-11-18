@@ -63,9 +63,9 @@ echo "=== GTT Memory Check Passed: pages_limit=${CURRENT_GTT_PAGES} (${GTT_GIB} 
 # ==============================================================================
 # 2. Model Array Matrix (Exact Paths for gpt-oss-20b and Full Qwen 27B A3B GGUF)
 # ==============================================================================
-MODEL_DIR="${MODEL_DIR:-/opt/models}"
+MODEL_DIR="${MODEL_DIR:-${REPO_DIR}/models}"
 GPT_OSS_20B_PATH="${GPT_OSS_20B_GGUF:-${MODEL_DIR}/gpt-oss-20b-Q4_K_M.gguf}"
-QWEN_27B_A3B_PATH="${QWEN_27B_A3B_GGUF:-${MODEL_DIR}/Qwen3-27B-A3B-Q4_K_M.gguf}"
+QWEN_27B_A3B_PATH="${QWEN_27B_A3B_GGUF:-${MODEL_DIR}/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
 
 # Optional DSpine draft sidecar/model paths per target model
 GPT_OSS_DSPINE_DRAFT="${GPT_OSS_DSPINE_DRAFT_GGUF:-${MODEL_DIR}/gpt-oss-20b-dspine-draft-Q8_0.gguf}"

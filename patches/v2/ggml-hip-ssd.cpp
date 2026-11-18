@@ -24,7 +24,6 @@
 #endif
 
 #include "ggml-hip-ssd.h"
-#include "ggml-impl.h"
 
 #if defined(__has_include)
 #  if __has_include(<hip/hip_runtime.h>)
@@ -751,13 +750,15 @@ struct apu_v2_engine::impl {
         if (!cgraph) {
             return routing_mode.load(std::memory_order_acquire);
         }
+        auto * mutable_graph         = const_cast<ggml_cgraph *>(cgraph);
+        const int n_nodes            = ggml_graph_n_nodes(mutable_graph);
         int32_t detected_experts     = 0;
         int32_t detected_expert_used = 0;
         int32_t mul_mat_id_nodes     = 0;
         bool    has_openai_swiglu    = false;
 
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
-            const ggml_tensor * node = cgraph->nodes[i];
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor * node = ggml_graph_node(mutable_graph, i);
             if (!node) {
                 continue;
             }
@@ -772,10 +773,10 @@ struct apu_v2_engine::impl {
         }
 
         if (has_openai_swiglu) {
-            return classify_model("gpt-oss-20b", detected_experts, detected_expert_used, cgraph->n_nodes);
+            return classify_model("gpt-oss-20b", detected_experts, detected_expert_used, n_nodes);
         }
         if (mul_mat_id_nodes == 0) {
-            return classify_model(model_hint ? model_hint : "dense-graph", 0, 0, cgraph->n_nodes);
+            return classify_model(model_hint ? model_hint : "dense-graph", 0, 0, n_nodes);
         }
         return classify_model(model_hint ? model_hint : "moe-graph", detected_experts, detected_expert_used, mul_mat_id_nodes);
     }

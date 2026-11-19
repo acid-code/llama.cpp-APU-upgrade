@@ -53,7 +53,8 @@ curl -L --fail --progress-bar \
 | **`v2-custom`** | Injects V2 `ggml-hip-ssd` (zero-copy GTT arena + Linux `io_uring` async prefetcher + closed 12-thread CPU worker pool + Dense Model Sleep logic). | Non-drafting MoE or dense inference with automatic core reservation (`12` compute threads on cores `0..11`, `4` threads on cores `12..15` reserved for OS/Tailscale/`io_uring`). |
 | **`dspine-baseline`** | Clean pull of upstream `origin/dspine` (`d493f841b` - DFlash/DSpine block-diffusion speculative decoding). | Baseline DFlash2 speculative decoding without custom V2 APU hooks. |
 | **`dspine-v2-custom`** | Merges `dspine-baseline` + `v2-custom` (`ggml-hip-ssd` V2). | Baseline DFlash2 + V2 APU backend without multi-size HIP graph cache. |
-| **`exp-coalesced-dflash`** | **Recommended Production Branch (Part B).** Builds on `dspine-v2-custom` with multi-size `gf_res_prev[10]` HIP graph cache (eliminates adaptive draft-length graph thrashing), opt-in `LLAMA_MOE_STATS=1` unique-expert telemetry, and experimental `--spec-draft-exp-*` coalescing flags. | **All `local-agent` production workloads** (`Qwen3.6-35B-A3B` + DFlash2 with `--spec-draft-p-min 0.55`, **37.28 tok/s** 5-prompt avg / **49.2 tok/s** reasoning bursts). |
+| **`exp-coalesced-dflash`** | **Recommended Production Branch (Part B).** Builds on `dspine-v2-custom` with multi-size `gf_res_prev[10]` HIP graph cache (eliminates adaptive draft-length graph thrashing), host-sync DFlash prefill fix, opt-in `LLAMA_MOE_STATS=1` unique-expert telemetry, and experimental `--spec-draft-exp-*` coalescing flags. | **All `local-agent` production workloads** (`Qwen3.6-35B-A3B` + DFlash2 with `--spec-draft-p-min 0.55`, **37.28 tok/s** 5-prompt avg / **49.2 tok/s** reasoning bursts / **25.0-30.9 tok/s** at 4K-18K context). |
+| **`exp-approx-routing`** | **Oversized MoE SSD Branch (Part A).** Builds on `exp-coalesced-dflash` with opt-in `LLAMA_APPROX_ROUTING` (`src/llama-approx-routing.{h,cpp}`): mean-centered router cosine-similarity substitution (`lru`, `mincore`, `hotset`, `trace`) and tail-expert `drop` (`id=-1`). Zero overhead when unset. | **Oversized >45 GiB MoE models paging from NVMe SSD** (`GLM-4.5-Air-UD-IQ3_XXS`: **-80.0% real SSD major page faults**, **+20.5% decode** `4.4 -> 5.3 tok/s`, `+0.83%` PPL). Leave unset for in-RAM `Qwen3.6-35B-A3B`. |
 
 ---
 
@@ -102,6 +103,62 @@ Measured across 5 diverse prompts (`coding`, `tech_512`, `reasoning`, `agent_jso
   2. **Expert-coalescing proxy negative result (in-RAM 256-expert MoE):** `LLAMA_MOE_STATS=1` confirmed unique experts/layer scale from `13.7` (batch=2) to `32.4` (batch=8), and both proxies separated lower- vs higher-novelty tokens, but per-token expert novelty varied by only ~5-11% across 256 experts while DFlash2 confidence `p_top` dominated acceptance value; sync/lookup overhead made pure `--spec-draft-p-min 0.55` + `gf_res_prev[10]` the clear winner.
   3. **GTT/Ollama OOM collision warning:** Never run a second 21 GiB `llama-server` or `ollama` GPU model concurrently with `Qwen3.6-35B-A3B` (2x ~22 GiB pinned TTM GTT exceeds 45 GiB RAM and causes an unrecoverable kernel OOM stall). Always verify `mem_info_gtt_used < 2 GiB` and `MemAvailable >= 28 GiB` before launching benchmarks.
 
+### 4.2 Long-Context Coding Agent Benchmark (4K / 8K / 16K, Native F16 KV + `amdgpu.cwsr_enable=0`)
+Measured on `Qwen3.6-35B-A3B` + `DFlash2` (`-c 32768 -np 1 -fa on -ub 64 -b 512 --spec-draft-n-max 7 --spec-draft-n-min 1 --spec-draft-p-min 0.55`, native F16 KV, `cache_prompt=true`, 256 output tokens/turn, 0 GPU resets, 0/0 graph reallocs, 468 graphs reused):
+
+| Case (Real C++ Code Excerpt) | Total In | Cached | Eval In | Prefill (`tok/s`) | TTFT (`s`) | Decode (`tok/s`) | DFlash Acc | Mean Len |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `4K_code T1` (cold) | `4,684` | `0` | `4,684` | `194.5` | `24.08` | **`29.38`** | `68.6%` | `3.24` |
+| `4K_code T2` (prefix hit) | `4,816` | `4,680` | `136` | `127.3` | **`1.07`** | **`30.87`** | `66.4%` | `3.46` |
+| `8K_code T1` (cold) | `9,348` | `23` | `9,325` | `186.3` | `50.07` | **`30.21`** | `70.5%` | `3.66` |
+| `8K_code T2` (prefix hit) | `9,474` | `9,344` | `130` | `126.3` | **`1.03`** | **`27.78`** | `70.2%` | `3.24` |
+| `16K_code T1` (cold) | `18,641` | `23` | `18,618` | `175.9` | `105.82` | **`25.63`** | `65.0%` | `3.28` |
+| `16K_code T2` (prefix hit) | `18,763` | `18,637` | `126` | `114.1` | **`1.10`** | **`24.95`** | `65.4%` | `3.12` |
+
+- **Long-Context Findings for `local-agent`:**
+  1. **Do NOT use `-ctk q8_0 -ctv q8_0` on `Qwen3.6-35B-A3B` + `DFlash2`:** Only 10/40 layers use attention (Gated DeltaNet), so native F16 KV at `-c 32768` uses only `~640 MiB`. Enabling `q8_0` KV forces `ggml-cuda/fattn.cu` `BEST_FATTN_KERNEL_MMA_F16` (`DKQ=256, gqa=8, n_tokens >= 3`) to dequantize K/V into temporary F16 buffers on every step, dropping 18K-22K decode from **`25.0-25.6 tok/s`** down to `~19.2 tok/s`.
+  2. **Prefix caching (`cache_prompt=true` + `-np 1`) cuts 18.7K TTFT by 96x (`105.8 s -> 1.10 s`):** Keep system prompt and repo context prefixes stable across turns and set client HTTP timeout >= `300 s` for cold 16K-24K Turn-1 prefills.
+  3. **`amdgpu.cwsr_enable=0` in GRUB is mandatory on `gfx1103`:** Eliminated recurring `MES failed to respond to msg=REMOVE_QUEUE` / `Failed to evict queue 3` GPU resets when `ctx_tgt` (queue 2) and `ctx_dft` (queue 3) run long multi-turn sessions.
+
+### 4.3 Part A: Similarity-Bounded Cold-Expert Substitution (`exp-approx-routing`)
+Opt-in MoE routing hook (`src/llama-approx-routing.{h,cpp}`, controlled by `LLAMA_APPROX_ROUTING`, zero overhead when unset) that computes per-layer mean-centered router cosine similarity from `blk.<L>.ffn_gate_inp.weight` and redirects cold low-weight tail experts (`w_rel < tau`, `protect_top=1`) to their highest-similarity distinct resident neighbor (`sim >= delta`).
+
+- **Phase-0 Router Geometry & Routing Skew:**
+  - `Qwen3.6-35B-A3B` (`256 x 2048` softmax, 40 MoE layers): `36-64%` shared mean-vector energy; centered top-1 median cos sim **`0.385`** (`70.3% > 0.30`, max `0.976`). Routing skew on WikiText-2: top 50% cover **`93.45%`**, top 75% cover **`98.76%`**.
+  - `GLM-4.5-Air-UD-IQ3_XXS` (`128 x 4096` sigmoid, 46 MoE layers): `19-27%` mean-vector energy; centered top-1 median cos sim **`0.099`** (~4x more orthogonal, requires `delta=0.05`). Routing skew: top 50% cover **`87.76%`**, top 75% cover **`98.08%`**.
+
+- **Simulated RAM Cap on `Qwen3.6-35B-A3B` (16-chunk WikiText-2, 8,192 tokens, `ROCm0`):**
+
+| Config (`Qwen3.6-35B-A3B`, `cap=50%` = `128/256` experts) | `tau / delta` | Cold Misses Eliminated | WikiText-2 PPL | `dPPL` vs Exact |
+| :--- | :---: | :---: | :---: | :---: |
+| Baseline (exact) | - | `0%` | **`7.0978 +/- 0.278`** | `0.000` |
+| `lru + sim` centered (`cap=50%`) | `0.12 / 0.25` | **`59.9%`** | **`7.0963`** | **`-0.002` (`-0.02%`)** |
+| `lru + sim` centered (`cap=50%`, aggressive) | `0.15 / 0.15` | **`92.1%`** | **`7.1258`** | **`+0.028` (`+0.39%`)** |
+| `lru + sim` centered (`cap=75%` = `192/256`) | `0.12 / 0.25` | **`77.8%`** | **`7.0789`** | **`-0.019` (`-0.27%`)** |
+| *Ablation:* `lru + random_resident` (`cap=50%`) | `0.12 / 0.25` | `60.1%` | `7.0510` | `-0.047` |
+
+- **Real NVMe SSD Paging on `GLM-4.5-Air-UD-IQ3_XXS` (`47.9 GiB` on `45 GiB` RAM, `-ngl 0 -lm mmap --no-repack`):**
+
+| Config (`GLM-4.5-Air-UD-IQ3_XXS`) | Decode (`-n 64`) | 3-Chunk PPL Time | **Real SSD Major Faults** | Fault Reduction | WikiText-2 PPL | `dPPL` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Baseline (exact)** | `4.4 tok/s` | `114 s` | **`836,571`** | `0%` | **`2.9751 +/- 0.216`** | `0.000` |
+| **`lru` (`75%` = `96/128`) + `sim` (`tau=0.15, delta=0.05`)** | **`5.3 tok/s` (`+20.5%`)** | **`103 s`** | **`167,718`** | **`-80.0%` (5.0x fewer)** | **`2.9999`** | **`+0.025` (`+0.83%`)** |
+| `lru` (`75%`) + `drop` (`tau=0.15`, CPU `id=-1`) | `5.2 tok/s` (`+18.2%`) | `107 s` | `194,525` | `-76.7%` (4.3x fewer) | `3.0424` | `+0.067` (`+2.26%`) |
+| `mincore` + `sim` / `drop` (`tau=0.15`) | `5.0 - 5.1 tok/s` | - | - | `74.4% - 81.4%` cold cut | - | - |
+| *Ablation:* `lru` (`75%`) + `random_resident` | - | `106 s` | `790,347` | `-5.5%` | `3.0192` | `+0.044` (`+1.48%`) |
+| *Stress test:* `hotset` (`75%`, `tau=0.25, protect_top=0`) + `drop` | `5.4 tok/s` | `96 s` | `148,670` | `-82.2%` | `3.5345` | `+0.559` (`+18.8%`) |
+
+- **Usage for oversized >45 GiB MoE models (`GLM-4.5-Air-UD-IQ3_XXS`):**
+```bash
+HIP_VISIBLE_DEVICES=-1 \
+LLAMA_APPROX_ROUTING=lru LLAMA_APPROX_SUB_POLICY=sim LLAMA_APPROX_CENTERED=1 \
+LLAMA_APPROX_CAP_PCT=75 LLAMA_APPROX_TAU=0.15 LLAMA_APPROX_DELTA=0.05 \
+./build-dspine-v2/bin/llama-cli \
+  -m models/GLM-4.5-Air-UD-IQ3_XXS/GLM-4.5-Air-UD-IQ3_XXS-00001-of-00002.gguf \
+  -lm mmap -fit off --no-repack -ub 64 -b 64 -t 12 -ngl 0 -c 2048
+```
+> **Note:** Leave `LLAMA_APPROX_ROUTING` unset for in-RAM `Qwen3.6-35B-A3B` (`20.6 GiB` fits 100% in GTT with 0 SSD faults, and enabling a CPU custom op splits HIP graph capture).
+
 ### Architectural Comparison: 100% iGPU vs Hybrid CPU+iGPU on Models That Fit in GTT
 We also tested splitting 16 out of 40 MoE layers of `Qwen3.6-35B-A3B` onto the Zen 4 AVX-512 CPU (`7,956 MiB` in V2 zero-copy GTT host memory) while keeping Attention + 24 MoE layers + DFlash2 on the Radeon 780M:
 - **100% Radeon 780M (`-ngl 999 -ngld 999 -lm none -fa on -ub 64`)**: **165.2 tok/s** Prompt | **36.6 tok/s** Decode (128-token test)
@@ -136,7 +193,7 @@ export HIP_VISIBLE_DEVICES=0
   -md /home/acid/projects/llama.cpp-APU-upgrade/models/qwen36-35b-a3b-dflash-Q8_0.gguf \
   -ngl 999 -ngld 999 \
   --spec-draft-n-max 7 --spec-draft-n-min 1 --spec-draft-p-min 0.55 \
-  -fit off -lm none -fa on -ub 64 -b 512 -t 12 -c 16384 \
+  -fit off -lm none -fa on -ub 64 -b 512 -t 12 -c 32768 -np 1 --jinja \
   --host 0.0.0.0 --port 8080
 ```
 
@@ -190,9 +247,9 @@ If you ever reinstall Ubuntu or migrate to a new APU server, apply these exact s
 - **UMA Frame Buffer Size:** `1G` (leaves **45 GiB** of physical RAM visible to Linux instead of carving out 12 GiB as static VRAM)
 
 ### 2. GRUB Kernel Parameters (`/etc/default/grub`)
-Allocates a **40 GiB Unified GTT Pool** (`10485760` pages * 4096 bytes) and disables the 1 GiB `crashkernel` reservation:
+Allocates a **40 GiB Unified GTT Pool** (`10485760` pages * 4096 bytes), disables CWSR preemption (`amdgpu.cwsr_enable=0`, required on `gfx1103` to prevent `MES REMOVE_QUEUE` / `Failed to evict queue 3` GPU resets under DFlash2 dual-stream workloads), and disables the 1 GiB `crashkernel` reservation:
 ```bash
-sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="ttm.pages_limit=10485760 ttm.page_pool_size=10485760 amdgpu.gttsize=40960 crashkernel=no"/' /etc/default/grub
+sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="ttm.pages_limit=10485760 ttm.page_pool_size=10485760 amdgpu.gttsize=40960 amdgpu.cwsr_enable=0 crashkernel=no"/' /etc/default/grub
 if [ -f /etc/default/grub.d/kdump-tools.cfg ]; then
     sudo sed -i 's/crashkernel=[^"]*/crashkernel=no/g' /etc/default/grub.d/kdump-tools.cfg
 fi
@@ -203,6 +260,7 @@ Verify after reboot:
 ```bash
 free -h                                              # Should show Mem: 45Gi total, ~44Gi available
 cat /sys/module/ttm/parameters/pages_limit           # Should print 10485760 (40 GiB)
+cat /sys/module/amdgpu/parameters/cwsr_enable        # Should print 0
 cat /sys/class/drm/card*/device/mem_info_vram_total  # Should print 1073741824 (1 GiB)
 cat /sys/class/drm/card*/device/mem_info_gtt_total   # Should print 42949672960 (40 GiB)
 ```

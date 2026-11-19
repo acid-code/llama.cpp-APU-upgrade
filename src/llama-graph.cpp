@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-approx-routing.h"
 #include "llama-moe-cache.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
@@ -1593,6 +1594,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    approx_routing   (params.approx_routing),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -2426,6 +2428,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    if (approx_routing != nullptr && approx_routing->is_layer_enabled(il, n_tokens)) {
+        ggml_tensor * ids_in = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
+        selected_experts = approx_routing->build_rewrite(ctx0, ids_in, weights, il);
+        cb(selected_experts, "ffn_moe_topk_approx", il);
+    }
 
     // the experts of host-resident layers may be read from the MoE cache, and part of the misses computed from the host experts
     // the CPU part does not support weights before the FFN, LoRAs or rotated experts

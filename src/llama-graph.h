@@ -23,6 +23,7 @@ struct llama_model;
 struct llama_prec_policy;
 struct llama_hadamard;
 
+class llama_approx_routing;
 class llama_moe_cache;
 
 struct llama_memory_context_i;
@@ -805,6 +806,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_approx_routing   * approx_routing;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -1077,6 +1079,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_approx_routing   * approx_routing;
 
     const llama_prec_policy * prec_policy;
 

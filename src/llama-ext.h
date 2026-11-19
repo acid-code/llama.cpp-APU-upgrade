@@ -109,8 +109,9 @@ struct llama_device_memory_data {
 // TODO: convert to C-style data structure
 using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data>;
 
-LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
-LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
+LLAMA_API int32_t llama_model_n_expert     (const struct llama_model * model);
+LLAMA_API int32_t llama_model_n_expert_used(const struct llama_model * model);
+LLAMA_API int32_t llama_model_n_devices    (const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
@@ -199,6 +200,17 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 // same as above, but only the rows of the given tokens, in order (n_tokens * n_embd elements)
 // returns the number of elements written or 0 on error
 LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const llama_token * tokens, uint32_t n_tokens, float * out);
+
+// retrieves the MoE router gate weights (blk.<lid>.ffn_gate_inp.weight) in F32 [n_embd, n_expert]
+// if out is nullptr, returns total number of elements without writing
+LLAMA_API uint32_t llama_model_get_moe_router_weights(const struct llama_model * model, uint32_t lid, float * out);
+
+// enable extraction of selected MoE expert IDs [n_expert_used, n_tokens] for layer lid
+LLAMA_API void llama_set_extract_moe_topk(struct llama_context * ctx, uint32_t lid, bool value);
+
+// get extracted MoE expert IDs from the most recent decode() for layer lid
+// row r (0 <= r < *n_tokens_out) starts at ptr + r * (*row_stride_out), with n_expert_used valid entries
+LLAMA_API const int32_t * llama_get_moe_topk(struct llama_context * ctx, uint32_t lid, int32_t * n_tokens_out, int32_t * row_stride_out);
 
 // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);

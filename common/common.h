@@ -334,6 +334,9 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    float exp_penalty = 0.0f; // expert-coalescing probability penalty scaled by marginal new-expert fraction
+    float exp_cost    = 0.0f; // expert-coalescing marginal DDR5 cost weight for throughput-optimal truncation
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match

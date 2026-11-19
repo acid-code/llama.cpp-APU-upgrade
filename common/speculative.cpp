@@ -13,6 +13,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -20,6 +21,7 @@
 #include <iomanip>
 #include <map>
 #include <random>
+#include <unordered_map>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1030,6 +1032,132 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // inject target features from the target's device buffer instead of host copies (env LLAMA_DFLASH_DEV=0 disables)
     bool use_dev_features = false;
 
+    // Expert-Coalesced Speculation state (enabled when exp_penalty > 0 or exp_cost > 0 on MoE targets)
+    static constexpr uint32_t k_exp_max_layers = 4;
+    static constexpr uint32_t k_exp_mask_words = 8; // up to 512 experts per layer
+
+    struct exp_bitmask {
+        uint64_t w[k_exp_mask_words] = {};
+    };
+
+    struct token_exp_sig {
+        exp_bitmask layers[k_exp_max_layers];
+        uint32_t    n_layers = 0; // 1 for Layer-0 router fallback, tracked_layers.size() for online observed
+    };
+
+    bool     use_exp_coalesce      = false;
+    bool     exp_proxy_router_only = false;
+    bool     exp_proxy_uniform     = false;
+    int32_t  n_expert_tgt      = 0;
+    int32_t  n_expert_used_tgt = 0;
+    uint32_t n_mask_words      = 0;
+    std::vector<uint32_t> tracked_moe_layers;
+    std::vector<float>    layer0_router_w; // [n_expert, n_embd_tgt] F32 row-major
+    std::vector<float>    tok_embd_tmp;
+    std::vector<float>    router_scores_tmp;
+    std::unordered_map<llama_token, token_exp_sig> online_exp_cache;
+    std::unordered_map<llama_token, token_exp_sig> router_exp_cache;
+
+    uint64_t stat_coalesce_drafts       = 0;
+    uint64_t stat_coalesce_truncs       = 0;
+    uint64_t stat_coalesce_cache_hits   = 0;
+    uint64_t stat_coalesce_cache_misses = 0;
+    double   stat_coalesce_frac_kept    = 0.0;
+    double   stat_coalesce_frac_dropped = 0.0;
+    uint64_t stat_coalesce_tok_kept     = 0;
+    uint64_t stat_coalesce_tok_dropped  = 0;
+
+    static inline uint32_t popcnt64(uint64_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+        return (uint32_t) __builtin_popcountll(x);
+#else
+        uint32_t c = 0;
+        while (x) { x &= x - 1; ++c; }
+        return c;
+#endif
+    }
+
+    const token_exp_sig * lookup_token_exp(llama_token tok) {
+        if (exp_proxy_uniform) {
+            return nullptr;
+        }
+        if (!exp_proxy_router_only) {
+            auto it = online_exp_cache.find(tok);
+            if (it != online_exp_cache.end()) {
+                stat_coalesce_cache_hits++;
+                return &it->second;
+            }
+        }
+        stat_coalesce_cache_misses++;
+
+        auto rit = router_exp_cache.find(tok);
+        if (rit != router_exp_cache.end()) {
+            return &rit->second;
+        }
+
+        if (layer0_router_w.empty() || tok < 0) {
+            return nullptr;
+        }
+
+        const llama_model * model_tgt = llama_get_model(params.ctx_tgt);
+        if (llama_model_get_tok_embd_rows(model_tgt, &tok, 1, tok_embd_tmp.data()) == 0) {
+            return nullptr;
+        }
+
+        // Compute Layer-0 router scores: [n_expert] = layer0_router_w @ tok_embd
+        const int32_t E = n_expert_tgt;
+        const int32_t D = n_embd_tgt;
+        const float * x = tok_embd_tmp.data();
+        for (int32_t e = 0; e < E; ++e) {
+            const float * w = layer0_router_w.data() + (size_t) e * D;
+            float acc = 0.0f;
+            for (int32_t d = 0; d < D; ++d) {
+                acc += w[d] * x[d];
+            }
+            router_scores_tmp[e] = acc;
+        }
+
+        // Pick top n_expert_used_tgt experts
+        token_exp_sig sig;
+        sig.n_layers = 1;
+        const int32_t K = std::min(n_expert_used_tgt, E);
+        for (int32_t k = 0; k < K; ++k) {
+            int32_t best = 0;
+            float best_s = -1e30f;
+            for (int32_t e = 0; e < E; ++e) {
+                if (router_scores_tmp[e] > best_s) {
+                    best_s = router_scores_tmp[e];
+                    best = e;
+                }
+            }
+            router_scores_tmp[best] = -1e30f;
+            if (best >= 0 && best < (int32_t) (k_exp_mask_words * 64)) {
+                sig.layers[0].w[best >> 6] |= (1ull << (best & 63));
+            }
+        }
+
+        auto [ins_it, ok] = router_exp_cache.emplace(tok, sig);
+        return &ins_it->second;
+    }
+
+    float compute_and_update_union(const token_exp_sig * sig, exp_bitmask * union_masks) const {
+        if (!sig || sig->n_layers == 0 || n_expert_used_tgt <= 0) {
+            return 1.0f;
+        }
+        uint32_t new_cnt = 0;
+        uint32_t tot_cnt = 0;
+        for (uint32_t m = 0; m < sig->n_layers; ++m) {
+            for (uint32_t w = 0; w < n_mask_words; ++w) {
+                const uint64_t bits = sig->layers[m].w[w];
+                const uint64_t novel = bits & ~union_masks[m].w[w];
+                new_cnt += popcnt64(novel);
+                tot_cnt += popcnt64(bits);
+                union_masks[m].w[w] |= bits;
+            }
+        }
+        return tot_cnt > 0 ? (float) new_cnt / (float) tot_cnt : 1.0f;
+    }
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1164,9 +1292,59 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
+
+        // Initialize Expert-Coalesced Speculation when requested on MoE targets
+        if (is_dflash2 && (this->params.exp_penalty > 0.0f || this->params.exp_cost > 0.0f)) {
+            n_expert_tgt      = llama_model_n_expert(model_tgt);
+            n_expert_used_tgt = llama_model_n_expert_used(model_tgt);
+            if (n_expert_tgt > 1 && n_expert_tgt <= (int32_t) (k_exp_mask_words * 64) && n_expert_used_tgt > 0) {
+                n_mask_words = (uint32_t) ((n_expert_tgt + 63) / 64);
+                const uint32_t n_layer_tgt = (uint32_t) llama_model_n_layer(model_tgt);
+
+                const char * proxy_env = std::getenv("LLAMA_DFLASH_EXP_PROXY");
+                exp_proxy_router_only = proxy_env != nullptr && std::strcmp(proxy_env, "router") == 0;
+                exp_proxy_uniform     = proxy_env != nullptr && std::strcmp(proxy_env, "uniform") == 0;
+
+                if (!exp_proxy_router_only && !exp_proxy_uniform && n_layer_tgt > 0) {
+                    const uint32_t n_track = std::min<uint32_t>(k_exp_max_layers, n_layer_tgt);
+                    for (uint32_t m = 0; m < n_track; ++m) {
+                        const uint32_t lid = n_track == 1 ? 0 : (m * (n_layer_tgt - 1)) / (n_track - 1);
+                        tracked_moe_layers.push_back(lid);
+                        llama_set_extract_moe_topk(ctx_tgt, lid, true);
+                    }
+                }
+
+                if (!exp_proxy_uniform) {
+                    const uint32_t router_elems = llama_model_get_moe_router_weights(model_tgt, 0, nullptr);
+                    if (router_elems == (uint32_t) (n_expert_tgt * n_embd_tgt)) {
+                        layer0_router_w.resize(router_elems);
+                        llama_model_get_moe_router_weights(model_tgt, 0, layer0_router_w.data());
+                        tok_embd_tmp.resize(n_embd_tgt);
+                        router_scores_tmp.resize(n_expert_tgt);
+                    }
+                }
+
+                use_exp_coalesce = exp_proxy_uniform || !tracked_moe_layers.empty() || !layer0_router_w.empty();
+                LOG_INF("%s: Expert-Coalesced DFlash2 enabled (n_expert=%d, used=%d, penalty=%.2f, cost=%.3f, proxy=%s, tracked_layers=%zu)\n",
+                        __func__, n_expert_tgt, n_expert_used_tgt,
+                        this->params.exp_penalty, this->params.exp_cost,
+                        exp_proxy_uniform ? "uniform" : (exp_proxy_router_only ? "router" : "hybrid"),
+                        tracked_moe_layers.size());
+            }
+        }
     }
 
     ~common_speculative_impl_draft_dflash() override {
+        if (use_exp_coalesce && stat_coalesce_drafts > 0) {
+            const uint64_t total_lookups = stat_coalesce_cache_hits + stat_coalesce_cache_misses;
+            LOG_INF("%s: Expert-Coalesced DFlash2 stats: drafts=%llu, truncs=%llu, cache_hit=%.1f%%, avg_frac_new_kept=%.3f, avg_frac_new_dropped=%.3f\n",
+                    __func__,
+                    (unsigned long long) stat_coalesce_drafts,
+                    (unsigned long long) stat_coalesce_truncs,
+                    total_lookups > 0 ? 100.0 * (double) stat_coalesce_cache_hits / (double) total_lookups : 0.0,
+                    stat_coalesce_tok_kept > 0 ? stat_coalesce_frac_kept / (double) stat_coalesce_tok_kept : 0.0,
+                    stat_coalesce_tok_dropped > 0 ? stat_coalesce_frac_dropped / (double) stat_coalesce_tok_dropped : 0.0);
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1234,6 +1412,51 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
+
+        // Update online token -> multi-layer expert bitmask cache from target verification pass
+        if (use_exp_coalesce && !exp_proxy_router_only && has_tokens && !tracked_moe_layers.empty()) {
+            const uint32_t n_track = (uint32_t) tracked_moe_layers.size();
+            const int32_t * layer_ptrs[k_exp_max_layers] = {};
+            int32_t n_extracted = 0;
+            int32_t row_stride = 0;
+            bool ok_all = true;
+            for (uint32_t m = 0; m < n_track; ++m) {
+                int32_t nt = 0;
+                int32_t rs = 0;
+                layer_ptrs[m] = llama_get_moe_topk(ctx_tgt, tracked_moe_layers[m], &nt, &rs);
+                if (!layer_ptrs[m] || nt <= 0 || rs <= 0) {
+                    ok_all = false;
+                    break;
+                }
+                if (m == 0) {
+                    n_extracted = nt;
+                    row_stride  = rs;
+                } else {
+                    n_extracted = std::min(n_extracted, nt);
+                }
+            }
+            if (ok_all && row_stride > 0) {
+                const int32_t n_update = std::min(n_tokens, n_extracted);
+                for (int32_t r = 0; r < n_update; ++r) {
+                    const llama_token tok = batch_in.tokens[r].id;
+                    if (tok < 0) {
+                        continue;
+                    }
+                    token_exp_sig sig;
+                    sig.n_layers = n_track;
+                    for (uint32_t m = 0; m < n_track; ++m) {
+                        const int32_t * row_ids = layer_ptrs[m] + (size_t) r * row_stride;
+                        for (int32_t k = 0; k < n_expert_used_tgt; ++k) {
+                            const int32_t e = row_ids[k];
+                            if (e >= 0 && e < n_expert_tgt) {
+                                sig.layers[m].w[e >> 6] |= (1ull << (e & 63));
+                            }
+                        }
+                    }
+                    online_exp_cache[tok] = sig;
+                }
+            }
+        }
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
@@ -1402,6 +1625,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 std::vector<float>   probs;
                 std::vector<int32_t> sorted_idx;
 
+                exp_bitmask union_masks[k_exp_max_layers];
+                std::vector<float> step_probs;
+                std::vector<float> step_frac_new;
+                if (use_exp_coalesce) {
+                    stat_coalesce_drafts++;
+                    const token_exp_sig * anchor_sig = lookup_token_exp(dp.id_last);
+                    compute_and_update_union(anchor_sig, union_masks);
+                    if (params.exp_cost > 0.0f) {
+                        step_probs.reserve(n_block_tokens);
+                        step_frac_new.reserve(n_block_tokens);
+                    }
+                }
+
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
@@ -1410,7 +1646,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
-                    if (params.p_min > 0.0f || sample) {
+                    float p_top = 1.0f;
+                    if (params.p_min > 0.0f || sample || use_exp_coalesce) {
                         // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
                         probs.resize(top_k);
                         float sum = 0.0f;
@@ -1418,7 +1655,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             probs[k] = std::exp((scores[k] - scores[predecessor]) / temp);
                             sum += probs[k];
                         }
-                        if (1.0f / sum < params.p_min) {
+                        p_top = 1.0f / sum;
+                        if (p_top < params.p_min) {
                             break;
                         }
                         for (int32_t k = 0; k < top_k; ++k) {
@@ -1449,7 +1687,69 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             q.push_back({ (llama_token) row[k], scores[k], probs[k] });
                         }
                     }
-                    result.push_back((llama_token) row[predecessor]);
+                    const llama_token cand_tok = (llama_token) row[predecessor];
+                    if (use_exp_coalesce) {
+                        const token_exp_sig * cand_sig = lookup_token_exp(cand_tok);
+                        const float frac_new = compute_and_update_union(cand_sig, union_masks);
+                        if (params.exp_penalty > 0.0f && (int32_t) result.size() >= params.n_min) {
+                            const float p_thresh = params.p_min + params.exp_penalty * frac_new;
+                            if (p_top < p_thresh) {
+                                stat_coalesce_truncs++;
+                                stat_coalesce_frac_dropped += frac_new;
+                                stat_coalesce_tok_dropped++;
+                                if (sample && !dp.result_q->empty()) {
+                                    dp.result_q->pop_back();
+                                }
+                                break;
+                            }
+                        }
+                        if (params.exp_cost > 0.0f) {
+                            step_probs.push_back(p_top);
+                            step_frac_new.push_back(frac_new);
+                        } else {
+                            stat_coalesce_frac_kept += frac_new;
+                            stat_coalesce_tok_kept++;
+                        }
+                    }
+                    result.push_back(cand_tok);
+                }
+
+                // Throughput-optimal lookahead truncation across full DFlash2 draft block
+                if (use_exp_coalesce && params.exp_cost > 0.0f && !result.empty()) {
+                    const size_t n_cand = result.size();
+                    const size_t k_min = std::min<size_t>((size_t) std::max(params.n_min, 1), n_cand);
+                    size_t best_k = n_cand;
+                    float best_rate = -1.0f;
+                    float p_cum = 1.0f;
+                    float exp_acc = 1.0f;
+                    float cost_acc = 1.0f;
+                    for (size_t k = 1; k <= n_cand; ++k) {
+                        p_cum *= step_probs[k - 1];
+                        exp_acc += p_cum;
+                        cost_acc += params.exp_cost * step_frac_new[k - 1];
+                        if (k >= k_min) {
+                            const float rate = exp_acc / cost_acc;
+                            if (rate > best_rate) {
+                                best_rate = rate;
+                                best_k = k;
+                            }
+                        }
+                    }
+                    for (size_t k = 0; k < best_k; ++k) {
+                        stat_coalesce_frac_kept += step_frac_new[k];
+                        stat_coalesce_tok_kept++;
+                    }
+                    if (best_k < n_cand) {
+                        stat_coalesce_truncs++;
+                        for (size_t k = best_k; k < n_cand; ++k) {
+                            stat_coalesce_frac_dropped += step_frac_new[k];
+                            stat_coalesce_tok_dropped++;
+                        }
+                        result.resize(best_k);
+                        if (sample && dp.result_q && dp.result_q->size() > best_k) {
+                            dp.result_q->resize(best_k);
+                        }
+                    }
                 }
 
                 if (result.size() < (size_t) params.n_min) {

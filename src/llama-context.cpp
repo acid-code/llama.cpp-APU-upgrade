@@ -226,6 +226,9 @@ llama_context::llama_context(
     cparams.embeddings_layer_inp_dev = false;
     embd_layer_inp.resize(hparams.n_layer() + 1);
 
+    cparams.extract_moe_topk.resize(hparams.n_layer(), false);
+    moe_topk_ids.resize(hparams.n_layer());
+
     cparams.ctx_type          = params.ctx_type;
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.pooling_type      = params.pooling_type;
@@ -367,6 +370,18 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+
+    {
+        const char * env_moe_stats = std::getenv("LLAMA_MOE_STATS");
+        if (env_moe_stats != nullptr && std::atoi(env_moe_stats) != 0 && hparams.n_expert > 1 && hparams.n_expert_used_max() > 0) {
+            moe_stats_enabled = true;
+            std::fill(cparams.extract_moe_topk.begin(), cparams.extract_moe_topk.end(), true);
+            const size_t cap = (size_t) hparams.n_expert * std::max<uint32_t>(cparams.n_batch, 1u);
+            for (auto & buf : moe_topk_ids) {
+                buf.resize(cap);
+            }
+        }
+    }
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 
@@ -639,6 +654,29 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (moe_stats_enabled && !moe_stats_by_batch.empty()) {
+        uint64_t total_calls = 0;
+        uint64_t total_layer_evals = 0;
+        uint64_t total_unique_loads = 0;
+        LLAMA_LOG_INFO("\n=== LLAMA_MOE_STATS (n_expert=%u, n_expert_used=%u, n_layer=%u) ===\n",
+                model.hparams.n_expert, model.hparams.n_expert_used_max(), model.hparams.n_layer());
+        for (const auto & kv : moe_stats_by_batch) {
+            const int32_t bsz = kv.first;
+            const auto & st = kv.second;
+            const double avg_unq = st.layer_evals > 0 ? (double) st.unique_sum / (double) st.layer_evals : 0.0;
+            LLAMA_LOG_INFO("  batch=%2d | calls=%4llu | avg_unique_experts/layer=%6.2f | unique/tok=%5.2f\n",
+                    bsz, (unsigned long long) st.calls, avg_unq, bsz > 0 ? avg_unq / (double) bsz : 0.0);
+            if (bsz <= 16) {
+                total_calls += st.calls;
+                total_layer_evals += st.layer_evals;
+                total_unique_loads += st.unique_sum;
+            }
+        }
+        const double overall_avg = total_layer_evals > 0 ? (double) total_unique_loads / (double) total_layer_evals : 0.0;
+        LLAMA_LOG_INFO("  DECODE_SUMMARY (batch<=16): calls=%llu | avg_unique_experts/layer=%.2f | total_unique_expert_loads=%llu\n",
+                (unsigned long long) total_calls, overall_avg, (unsigned long long) total_unique_loads);
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
@@ -1226,6 +1264,19 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     return embd_layer_inp[lid].data;
 }
 
+const int32_t * llama_context::get_moe_topk(uint32_t lid, int32_t * n_tokens_out, int32_t * row_stride_out) {
+    if (n_tokens_out) {
+        *n_tokens_out = moe_topk_n_tokens;
+    }
+    if (row_stride_out) {
+        *row_stride_out = moe_topk_row_stride;
+    }
+    if (lid >= moe_topk_ids.size() || moe_topk_ids[lid].empty() || moe_topk_n_tokens <= 0 || moe_topk_row_stride <= 0) {
+        return nullptr;
+    }
+    return moe_topk_ids[lid].data();
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1446,6 +1497,22 @@ void llama_context::set_embeddings_layer_inp_dev(bool value) {
     cparams.embeddings_layer_inp_dev = value;
 
     layer_inp_dev_alloc();
+}
+
+void llama_context::set_extract_moe_topk(uint32_t lid, bool enable) {
+    if (lid >= cparams.extract_moe_topk.size()) {
+        return;
+    }
+    if (enable && model.hparams.n_expert > 0) {
+        const size_t cap = (size_t) model.hparams.n_expert * std::max<uint32_t>(cparams.n_batch, 1u);
+        if (moe_topk_ids[lid].size() < cap) {
+            moe_topk_ids[lid].resize(cap);
+        }
+    }
+    if (cparams.extract_moe_topk[lid] != enable) {
+        cparams.extract_moe_topk[lid] = enable;
+        sched_need_reserve = true;
+    }
 }
 
 bool llama_context::supports_embd_row() const {
@@ -1682,7 +1749,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
+    auto * res = get_gf_res_prev(ubatch.n_tokens);
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -2182,6 +2249,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_backend_event_wait(layer_inp_backend, ev_layer_inp_read.get());
     }
 
+    moe_topk_n_tokens = 0;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -2326,6 +2395,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         // [TAG_EXTRACT_TARGET_EMBEDDINGS]
         bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        extract_moe_topk_ids(res, n_tokens_prev, ubatch.n_tokens);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2367,6 +2437,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    if (moe_stats_enabled && n_tokens_prev > 0) {
+        synchronize();
+        record_moe_topk_stats(n_tokens_prev);
+    }
 
     if (layer_inp_dev && ev_layer_inp_written) {
         ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
@@ -2638,6 +2713,87 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
     return extracted;
 }
 
+void llama_context::extract_moe_topk_ids(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    const uint32_t n_expert = model.hparams.n_expert;
+    const uint32_t n_expert_used = model.hparams.n_expert_used_max();
+    if (n_expert == 0 || n_expert_used == 0 || n_tokens == 0) {
+        return;
+    }
+
+    bool any_extracted = false;
+    int32_t stride_used = 0;
+    for (uint32_t il = 0; il < cparams.extract_moe_topk.size(); ++il) {
+        if (!cparams.extract_moe_topk[il]) {
+            continue;
+        }
+        ggml_tensor * t = res->get_moe_topk((int) il);
+        if (!t) {
+            continue;
+        }
+
+        ggml_tensor * src_t = t->view_src ? t->view_src : t;
+        const size_t src_offs   = t->view_src ? t->view_offs : 0;
+        const size_t row_stride = t->nb[1] / sizeof(int32_t);
+        const size_t copy_elems = (n_tokens - 1) * row_stride + (size_t) t->ne[0];
+        const size_t copy_bytes = copy_elems * sizeof(int32_t);
+        const size_t dst_offset = token_offset * row_stride;
+        if (dst_offset + copy_elems > moe_topk_ids[il].size() || src_offs + copy_bytes > ggml_nbytes(src_t)) {
+            continue;
+        }
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), src_t);
+        if (!backend) {
+            continue;
+        }
+        ggml_backend_tensor_get_async(backend, src_t, moe_topk_ids[il].data() + dst_offset, src_offs, copy_bytes);
+        stride_used = (int32_t) row_stride;
+        any_extracted = true;
+    }
+
+    if (any_extracted) {
+        moe_topk_n_tokens   = (int32_t) (token_offset + n_tokens);
+        moe_topk_row_stride = stride_used;
+    }
+}
+
+void llama_context::record_moe_topk_stats(size_t n_tokens) {
+    const uint32_t n_expert      = model.hparams.n_expert;
+    const uint32_t n_expert_used = model.hparams.n_expert_used_max();
+    if (n_expert == 0 || n_expert_used == 0 || n_tokens == 0 || moe_topk_row_stride <= 0) {
+        return;
+    }
+
+    auto & st = moe_stats_by_batch[(int32_t) n_tokens];
+    st.calls++;
+
+    const size_t row_stride = (size_t) moe_topk_row_stride;
+    std::vector<uint8_t> seen(n_expert, 0);
+    for (uint32_t il = 0; il < moe_topk_ids.size(); ++il) {
+        if (!cparams.extract_moe_topk[il]) {
+            continue;
+        }
+        const size_t needed = (n_tokens - 1) * row_stride + n_expert_used;
+        if (moe_topk_ids[il].size() < needed) {
+            continue;
+        }
+        std::fill(seen.begin(), seen.end(), 0);
+        uint32_t unique_cnt = 0;
+        const int32_t * ids = moe_topk_ids[il].data();
+        for (size_t r = 0; r < n_tokens; ++r) {
+            const int32_t * row = ids + r * row_stride;
+            for (uint32_t k = 0; k < n_expert_used; ++k) {
+                const int32_t e = row[k];
+                if (e >= 0 && (uint32_t) e < n_expert && !seen[e]) {
+                    seen[e] = 1;
+                    unique_cnt++;
+                }
+            }
+        }
+        st.layer_evals++;
+        st.unique_sum += unique_cnt;
+    }
+}
+
 void llama_context::output_reorder() {
     const uint64_t n_vocab     = model.vocab.n_tokens();
     const uint64_t n_embd      = model.hparams.n_embd;
@@ -2776,8 +2932,9 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
-llm_graph_result * llama_context::get_gf_res_prev() {
-    auto & res = gf_res_prev[n_outputs > 0];
+llm_graph_result * llama_context::get_gf_res_prev(uint32_t n_tokens) {
+    const size_t idx = n_outputs == 0 ? 0 : (n_tokens >= 1 && n_tokens <= 8 ? (size_t) n_tokens : 9);
+    auto & res = gf_res_prev[idx];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
     }
@@ -4145,7 +4302,7 @@ void llama_context::opt_epoch_iter(
                 break;
             }
 
-            auto * res = get_gf_res_prev();
+            auto * res = get_gf_res_prev(ubatch.n_tokens);
 
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
@@ -4570,6 +4727,16 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
 
     return ctx->get_embeddings_layer_inp(lid);
+}
+
+void llama_set_extract_moe_topk(llama_context * ctx, uint32_t lid, bool value) {
+    ctx->set_extract_moe_topk(lid, value);
+}
+
+const int32_t * llama_get_moe_topk(llama_context * ctx, uint32_t lid, int32_t * n_tokens_out, int32_t * row_stride_out) {
+    ctx->synchronize();
+
+    return ctx->get_moe_topk(lid, n_tokens_out, row_stride_out);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

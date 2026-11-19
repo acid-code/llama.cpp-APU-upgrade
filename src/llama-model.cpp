@@ -3995,6 +3995,10 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
 
+int32_t llama_model_n_expert_used(const struct llama_model * model) {
+    return (int32_t) model->hparams.n_expert_used_max();
+}
+
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
 }
@@ -4187,4 +4191,26 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
     }
 
     return n_tokens * (uint32_t) tensor->ne[0];
+}
+
+uint32_t llama_model_get_moe_router_weights(const struct llama_model * model, uint32_t lid, float * out) {
+    if (model == nullptr || lid >= model->layers.size()) {
+        return 0;
+    }
+
+    const ggml_tensor * tensor = model->layers[lid].ffn_gate_inp;
+    if (tensor == nullptr) {
+        return 0;
+    }
+
+    const size_t nelements = ggml_nelements(tensor);
+    GGML_ASSERT(nelements <= UINT32_MAX);
+
+    if (out == nullptr) {
+        return (uint32_t) nelements;
+    }
+
+    llama_tensor_rows_to_f32(tensor, 0, tensor->ne[1], out);
+
+    return (uint32_t) nelements;
 }

@@ -92,6 +92,7 @@ struct llama_context {
     float * get_embeddings_nextn_ith(int32_t i);
 
     float * get_embeddings_layer_inp(uint32_t lid);
+    const int32_t * get_moe_topk(uint32_t lid, int32_t * n_tokens_out, int32_t * row_stride_out);
 
     ggml_tensor * get_layer_inp_dev() const { return layer_inp_dev; }
 
@@ -123,6 +124,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_embeddings_layer_inp_dev(bool value);
+    void set_extract_moe_topk(uint32_t lid, bool enable);
 
     // whether decode accepts entries whose embd is a row of ctx_other's layer input device buffer
     bool supports_embd_row() const;
@@ -248,6 +250,8 @@ private:
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
     bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_moe_topk_ids(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void record_moe_topk_stats(size_t n_tokens);
 
     // (re)allocate the device buffer for cparams.embeddings_layer_inp_dev
     void layer_inp_dev_alloc();
@@ -274,7 +278,7 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
-    llm_graph_result * get_gf_res_prev();
+    llm_graph_result * get_gf_res_prev(uint32_t n_tokens);
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -336,6 +340,17 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
+
+    std::vector<std::vector<int32_t>> moe_topk_ids;
+    int32_t moe_topk_n_tokens   = 0;
+    int32_t moe_topk_row_stride = 0;
+    bool    moe_stats_enabled   = false;
+    struct moe_batch_stat {
+        uint64_t calls       = 0;
+        uint64_t layer_evals = 0;
+        uint64_t unique_sum  = 0;
+    };
+    std::map<int32_t, moe_batch_stat> moe_stats_by_batch;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
@@ -422,8 +437,8 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // Separate arenas give distinct CUDA/HIP graph cache keys across no-output, small decode/speculative (1..8), and large batches.
+    std::array<llm_graph_result_ptr, 10> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;

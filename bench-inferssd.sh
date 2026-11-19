@@ -15,8 +15,9 @@
 #        - dspine-baseline
 #        - dspine-v2-custom
 #   4. Drafting Logic:
-#        - dspine-baseline & dspine-v2-custom: loop through draft block sizes 8, 12, 16, 20.
+#        - dspine-* & exp-* branches: sweep unclamped DFlash2 draft sizes 4, 5, 6, 7 and 7@p0.55.
 #        - main, v1-custom, v2-custom: standard non-drafting inference.
+#   5. Memory Safety Guard: verifies MemAvailable >= 28 GiB and GTT used <= 2 GiB before every run.
 #   5. Logging: Outputs benchmark_results.csv:
 #        Model Name,Branch Name,Block Size,Tokens-per-Second,Draft Acceptance Rate
 #   6. Verdict: Parses benchmark_results.csv and prints final "VERDICT:" with winning configuration
@@ -82,9 +83,12 @@ BRANCHES=(
     "v2-custom"
     "dspine-baseline"
     "dspine-v2-custom"
+    "exp-coalesced-dflash"
 )
 
-DRAFT_BLOCK_SIZES=(8 12 16 20)
+# DFlash2 model has dflash.block_size=8 (max draft tokens = block_size - 1 = 7).
+# Values >= 8 are silently clamped to 7; sweep real unclamped sizes plus p_min=0.55 adaptive truncation.
+DRAFT_BLOCK_SIZES=(4 5 6 7 "7@p0.55")
 
 cd "$REPO_DIR"
 ORIG_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")"
@@ -128,42 +132,75 @@ resolve_draft_model() {
     fi
 }
 
+check_gpu_memory_guard() {
+    local min_avail_kb=$((28 * 1024 * 1024))
+    local max_gtt_bytes=$((2 * 1024 * 1024 * 1024))
+    local avail_kb
+    avail_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+    local gtt_used=0
+    for f in /sys/class/drm/card*/device/mem_info_gtt_used; do
+        if [[ -r "$f" ]]; then
+            local v
+            v="$(tr -d '[:space:]' < "$f")"
+            if [[ "$v" =~ ^[0-9]+$ ]] && (( v > gtt_used )); then
+                gtt_used="$v"
+            fi
+        fi
+    done
+
+    if (( avail_kb < min_avail_kb || gtt_used > max_gtt_bytes )); then
+        local avail_gib gtt_gib
+        avail_gib="$(awk -v k="$avail_kb" 'BEGIN {printf "%.2f", k / (1024.0 * 1024.0)}')"
+        gtt_gib="$(awk -v b="$gtt_used" 'BEGIN {printf "%.2f", b / (1024.0 * 1024.0 * 1024.0)}')"
+        echo "SAFETY ABORT: MemAvailable=${avail_gib} GiB (need >= 28 GiB), GTT used=${gtt_gib} GiB (need <= 2 GiB)." >&2
+        echo "Another process (e.g. ollama or llama-server) holds GPU memory. Stop it to avoid a TTM OOM freeze." >&2
+        exit 1
+    fi
+}
+
 run_inference_and_parse() {
     local bin_dir="$1"
     local model_path="$2"
     local branch="$3"
-    local block_size="$4"
+    local block_spec="$4"
     local log_file="$5"
 
     local cli_bin="${bin_dir}/llama-cli"
     local spec_bin="${bin_dir}/llama-speculative"
 
+    local block_size="${block_spec%%@*}"
+    local p_min="0.00"
+    if [[ "$block_spec" == *"@p"* ]]; then
+        p_min="${block_spec#*@p}"
+    fi
+
     # Note: Do NOT pass --n-cpu-moe; custom V2 backend handles MoE routing natively
     local attempt=1
     while (( attempt <= 2 )); do
-        if [[ "$branch" == dspine-* ]]; then
+        check_gpu_memory_guard
+        if [[ "$branch" == dspine-* || "$branch" == exp-* ]]; then
             local draft_path
             draft_path="$(resolve_draft_model "$model_path")"
             local draft_args=()
             if [[ -f "$draft_path" ]]; then
-                draft_args=(-md "$draft_path" -ngld 999 --spec-draft-n-max "$block_size" --spec-draft-n-min 1 -lv 5)
+                draft_args=(-md "$draft_path" -ngld 999 --spec-draft-n-max "$block_size" --spec-draft-n-min 1 --spec-draft-p-min "$p_min" -lv 5)
             else
                 draft_args=(--spec-type ngram-simple --spec-draft-n-max "$block_size" --spec-draft-n-min 1 -lv 5)
             fi
 
             if [[ -x "$spec_bin" && -f "$draft_path" ]]; then
-                "$spec_bin" -m "$model_path" "${draft_args[@]}" \
+                timeout 180 "$spec_bin" -m "$model_path" "${draft_args[@]}" \
                     -fit off -lm none -fa on -ub 64 -b 512 -t 12 \
                     -p "$SYNTHETIC_PROMPT" -n "$GEN_TOKENS" --temp 0.0 --seed 42 -ngl 999 -c 4096 \
                     >"$log_file" 2>&1 || true
             else
-                "$cli_bin" -m "$model_path" "${draft_args[@]}" \
+                timeout 180 "$cli_bin" -m "$model_path" "${draft_args[@]}" \
                     -fit off -lm none -fa on -ub 64 -b 512 -t 12 \
                     -p "$SYNTHETIC_PROMPT" -n "$GEN_TOKENS" --temp 0.0 --seed 42 -ngl 999 -c 4096 --single-turn \
                     >"$log_file" 2>&1 || true
             fi
         else
-            "$cli_bin" -m "$model_path" \
+            timeout 180 "$cli_bin" -m "$model_path" \
                 -fit off -lm none -fa on -ub 64 -b 512 -t 12 \
                 -p "$SYNTHETIC_PROMPT" -n "$GEN_TOKENS" --temp 0.0 --seed 42 -ngl 999 -c 4096 --single-turn \
                 >"$log_file" 2>&1 || true
@@ -198,9 +235,9 @@ for pat in patterns:
         tps = float(matches[-1])
         break
 
-# Parse draft acceptance rate for dspine branches
+# Parse draft acceptance rate for dspine/exp branches
 acc_rate = "N/A"
-if branch.startswith("dspine-"):
+if branch.startswith("dspine-") or branch.startswith("exp-"):
     json_drafts = re.findall(r'"draft_n"\s*:\s*(\d+)\s*,\s*"draft_n_accepted"\s*:\s*(\d+)', text)
     spec_stats = re.findall(r"#gen tokens\s*=\s*(\d+),\s*#acc tokens\s*=\s*(\d+)", text)
     acc_matches = re.findall(r"(?:accept(?:ance|ed)?(?:\s+rate)?|f_acc)\s*[:=]\s*([\d.]+)\s*%?", text, flags=re.IGNORECASE)
@@ -265,7 +302,7 @@ for branch in "${BRANCHES[@]}"; do
 
         if [[ ! -f "$model_path" ]]; then
             echo "     [WARN] Model file not found at $model_path; recording 0.00 tok/s placeholder." >&2
-            if [[ "$branch" == dspine-* ]]; then
+            if [[ "$branch" == dspine-* || "$branch" == exp-* ]]; then
                 for bsize in "${DRAFT_BLOCK_SIZES[@]}"; do
                     echo "${model_name},${branch},${bsize},0.00,0.00%" >> "$CSV_OUT"
                 done
@@ -275,8 +312,8 @@ for branch in "${BRANCHES[@]}"; do
             continue
         fi
 
-        if [[ "$branch" == dspine-* ]]; then
-            # Drafting Logic: loop through draft block sizes 8, 12, 16, and 20
+        if [[ "$branch" == dspine-* || "$branch" == exp-* ]]; then
+            # Drafting Logic: sweep real unclamped DFlash2 draft sizes 4, 5, 6, 7 and 7@p0.55
             for bsize in "${DRAFT_BLOCK_SIZES[@]}"; do
                 sleep 4
                 echo "     [Run] branch=${branch} model=${model_name} draft_block_size=${bsize}..."

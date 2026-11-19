@@ -10,13 +10,13 @@
 
 ## 1. Executive Summary & Recommended `local-agent` Setup
 
-For daily 24/7 operation of `local-agent` (accessed via Tailscale from laptop/phone), **run `Qwen3.6-35B-A3B-UD-Q4_K_M` paired with its 545 MB `DFlash2` draft sidecar (`qwen36-35b-a3b-dflash-Q8_0.gguf`) on branch `dspine-v2-custom`**, alongside a lightweight 1.5B-3B router/embedding model.
+For daily 24/7 operation of `local-agent` (accessed via Tailscale from laptop/phone), **run `Qwen3.6-35B-A3B-UD-Q4_K_M` paired with its 545 MB `DFlash2` draft sidecar (`qwen36-35b-a3b-dflash-Q8_0.gguf`) on branch `exp-coalesced-dflash`** (built on `dspine-v2-custom` with the multi-size `gf_res_prev[10]` HIP graph cache and `--spec-draft-p-min 0.55`), alongside a lightweight 1.5B-3B router/embedding model.
 
 ### Why `Qwen3.6-35B-A3B` + `DFlash2` Wins Everything:
 1. **Faster AND Smarter than `gpt-oss-20b`:**
-   - Without the DFlash2 sidecar, `Qwen3.6-35B-A3B` decodes at **18.80 tok/s** (slower than `gpt-oss-20b` at **24.70 tok/s**).
-   - With the **545 MB DFlash2 sidecar** (`--spec-draft-n-max 12 --spec-draft-n-min 1`), `Qwen3.6-35B-A3B` jumps to **27.8 - 28.9 tok/s** sustained (and **32.3 - 36.8 tok/s** on 128-token reasoning/coding bursts, with **43.7% to 81.3% draft acceptance**).
-   - You get 35B MoE intelligence at **1.5x - 2.0x faster generation** and **158 - 165 tok/s prompt prefill**.
+   - Without the DFlash2 sidecar, `Qwen3.6-35B-A3B` decodes at **19.26 tok/s** (5-prompt average, slower than `gpt-oss-20b` at **24.70 tok/s**).
+   - With the **545 MB DFlash2 sidecar** (`--spec-draft-n-max 7 --spec-draft-n-min 1 --spec-draft-p-min 0.55`) + multi-size HIP graph caching (`gf_res_prev[10]`), `Qwen3.6-35B-A3B` jumps to **37.28 tok/s** 5-prompt average (**+93.6%** over non-speculative, **+12.3%** over the earlier `p_min=0.0` baseline at `33.20 tok/s`), peaking at **49.2 tok/s** on structured reasoning bursts with **71.1% average draft acceptance** (100% lossless).
+   - You get 35B MoE intelligence at **1.9x faster generation** and **105 - 196 tok/s prompt prefill**.
 2. **Plenty of Unified RAM Headroom (45 GiB Usable RAM):**
    - `Qwen3.6-35B-A3B` (`20.6 GiB`) + `DFlash2 Sidecar` (`0.55 GiB`) + `16K-32K KV Cache` (`~1.5 GiB`) = **~22.6 GiB**.
    - Adding a fast **1.5B-3B Router / Embedding model** (`~1.5 - 2.0 GiB`) + Ubuntu / Docker / Tailscale (`~1.5 GiB`) uses only **~25.6 GiB out of 45 GiB**, leaving **~19.4 GiB of free RAM**.
@@ -52,7 +52,8 @@ curl -L --fail --progress-bar \
 | **`v1-custom`** | Injects V1 `ggml-hip-ssd` (4096-byte page-aligned zero-copy GTT memory arena via `hipHostMallocMapped`). | Testing basic zero-copy GTT host allocations without speculative decoding. |
 | **`v2-custom`** | Injects V2 `ggml-hip-ssd` (zero-copy GTT arena + Linux `io_uring` async prefetcher + closed 12-thread CPU worker pool + Dense Model Sleep logic). | Non-drafting MoE or dense inference with automatic core reservation (`12` compute threads on cores `0..11`, `4` threads on cores `12..15` reserved for OS/Tailscale/`io_uring`). |
 | **`dspine-baseline`** | Clean pull of upstream `origin/dspine` (`d493f841b` - DFlash/DSpine block-diffusion speculative decoding). | Baseline DFlash2 speculative decoding without custom V2 APU hooks. |
-| **`dspine-v2-custom`** | **Recommended Production Branch.** Merges `dspine-baseline` + `v2-custom` (`ggml-hip-ssd` V2). | **All `local-agent` production workloads** (`Qwen3.6-35B-A3B` + DFlash2 sidecar, `gpt-oss-20b`, and oversized >45 GB MoE SSD streaming). |
+| **`dspine-v2-custom`** | Merges `dspine-baseline` + `v2-custom` (`ggml-hip-ssd` V2). | Baseline DFlash2 + V2 APU backend without multi-size HIP graph cache. |
+| **`exp-coalesced-dflash`** | **Recommended Production Branch (Part B).** Builds on `dspine-v2-custom` with multi-size `gf_res_prev[10]` HIP graph cache (eliminates adaptive draft-length graph thrashing), opt-in `LLAMA_MOE_STATS=1` unique-expert telemetry, and experimental `--spec-draft-exp-*` coalescing flags. | **All `local-agent` production workloads** (`Qwen3.6-35B-A3B` + DFlash2 with `--spec-draft-p-min 0.55`, **37.28 tok/s** 5-prompt avg / **49.2 tok/s** reasoning bursts). |
 
 ---
 
@@ -78,6 +79,28 @@ Measured on `mini-pc` (512-token technical prompt prefill + 256-token determinis
 | `Qwen3.6-35B-A3B-UD-Q4_K_M` | `dspine-v2-custom` | **12** | **27.60** | **165.2** | **`43.71%`** | **Recommended Sweet Spot** |
 | `Qwen3.6-35B-A3B-UD-Q4_K_M` | `dspine-v2-custom` | **16** | **27.35** *(36.8 @ 128 tok)* | **165.2** | **`43.71%`** *(81.3% @ 32 tok)* | Highest burst speed on reasoning/code |
 | `Qwen3.6-35B-A3B-UD-Q4_K_M` | `dspine-v2-custom` | **20** | **27.50** | **165.2** | **`43.71%`** | DFlash2 + V2 |
+
+> **Note on earlier `8 / 12 / 16 / 20` rows:** `qwen36-35b-a3b-dflash-Q8_0.gguf` has `dflash.block_size = 8`, so `common/speculative.cpp` silently clamped all values >= 8 down to `n_max = 7` (`block_size - 1`), which is why all four rows produced identical `43.71%` acceptance. See Section 4.1 below for the clean unclamped 5-prompt `llama-server` benchmark suite.
+
+### 4.1 Clean 5-Prompt `llama-server` Ablation (`exp-coalesced-dflash`, `bench-coalesced-dflash.py`)
+Measured across 5 diverse prompts (`coding`, `tech_512`, `reasoning`, `agent_json`, `python_algo`; 256 tokens each, `--temp 0.0 --seed 42`, warm `llama-server` with GTT/RAM collision guard):
+
+| Configuration (`Qwen3.6-35B-A3B` + `DFlash2`) | Avg Decode (`tok/s`) | `ms/step` | Avg Draft | Acceptance | Mean Len | Peak (`reasoning`) | vs Base `n7` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `no-draft` (100% Radeon 780M) | `19.26` | `51.72` | `0.00` | `0.0%` | `1.00` | `19.44` | `-42.0%` |
+| `base n7 p=0.00` *(old README config)* | `33.20` | `126.21` | `6.72` | `47.8%` | `4.20` | `45.49` | baseline |
+| `base n5 p=0.00` *(fixed `n_max=5`)* | `35.77` | `105.56` | `4.86` | `57.5%` | `3.79` | `46.24` | `+7.7%` |
+| `p_min=0.55` *(before `gf_res_prev[10]`)* | `34.88` | `111.88` | `4.09` | `71.1%` | `3.94` | `45.77` | `+5.1%` |
+| **`p_min=0.55` + `gf_res_prev[10]`** | **`37.28`** | **`104.69`** | **`4.09`** | **`71.1%`** | **`3.94`** | **`49.18`** | **`+12.3%`** |
+| **`p_min=0.60` + `gf_res_prev[10]`** | **`37.06`** | **`102.54`** | **`3.65`** | **`77.1%`** | **`3.85`** | **`49.20`** | **`+11.6%`** |
+| `p=0.45 + exp-penalty=0.20` (Layer-0 router) | `36.33` | `106.18` | `4.07` | `70.4%` | `3.89` | `47.79` | `+9.4%` |
+| `exp-cost=0.25` (uniform lookahead control) | `36.29` | `107.84` | `4.11` | `71.0%` | `3.95` | `46.14` | `+9.3%` |
+| `exp-cost=0.28` (4-layer online+router hybrid) | `35.20` | `113.64` | `4.70` | `63.7%` | `4.03` | `47.71` | `+6.0%` |
+
+- **Key Findings:**
+  1. **Multi-size `gf_res_prev[10]` HIP graph cache (`src/llama-context.cpp`):** Upstream only kept 2 arenas (`n_outputs == 0` vs `> 0`), so adaptive truncation (`p_min`) thrashed the `ggml-cuda` HIP graph cache across batch sizes `1..8` (+7 to 15 ms/step). Giving batch sizes `1..8` dedicated arenas raised `p_min=0.55` from `34.88` to **`37.28 tok/s`** (+12.3% over `base n7`, 100% lossless).
+  2. **Expert-coalescing proxy negative result (in-RAM 256-expert MoE):** `LLAMA_MOE_STATS=1` confirmed unique experts/layer scale from `13.7` (batch=2) to `32.4` (batch=8), and both proxies separated lower- vs higher-novelty tokens, but per-token expert novelty varied by only ~5-11% across 256 experts while DFlash2 confidence `p_top` dominated acceptance value; sync/lookup overhead made pure `--spec-draft-p-min 0.55` + `gf_res_prev[10]` the clear winner.
+  3. **GTT/Ollama OOM collision warning:** Never run a second 21 GiB `llama-server` or `ollama` GPU model concurrently with `Qwen3.6-35B-A3B` (2x ~22 GiB pinned TTM GTT exceeds 45 GiB RAM and causes an unrecoverable kernel OOM stall). Always verify `mem_info_gtt_used < 2 GiB` and `MemAvailable >= 28 GiB` before launching benchmarks.
 
 ### Architectural Comparison: 100% iGPU vs Hybrid CPU+iGPU on Models That Fit in GTT
 We also tested splitting 16 out of 40 MoE layers of `Qwen3.6-35B-A3B` onto the Zen 4 AVX-512 CPU (`7,956 MiB` in V2 zero-copy GTT host memory) while keeping Attention + 24 MoE layers + DFlash2 on the Radeon 780M:
@@ -112,7 +135,7 @@ export HIP_VISIBLE_DEVICES=0
   -m /home/acid/projects/llama.cpp-APU-upgrade/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
   -md /home/acid/projects/llama.cpp-APU-upgrade/models/qwen36-35b-a3b-dflash-Q8_0.gguf \
   -ngl 999 -ngld 999 \
-  --spec-draft-n-max 12 --spec-draft-n-min 1 \
+  --spec-draft-n-max 7 --spec-draft-n-min 1 --spec-draft-p-min 0.55 \
   -fit off -lm none -fa on -ub 64 -b 512 -t 12 -c 16384 \
   --host 0.0.0.0 --port 8080
 ```
@@ -153,7 +176,7 @@ export HIP_VISIBLE_DEVICES=0
 | **`-fit off`** | **Disables Startup Dummy Context Probe.** By default, `llama.cpp` allocates and destroys a temporary 21 GiB GPU context at boot to probe free memory before allocating the real context. Turning `-fit off` stops back-to-back 21 GiB KFD queue teardowns. |
 | **`-fa on`** | **Enables RDNA3 FlashAttention.** Dramatically reduces KV-cache memory size and speeds up both prompt prefill (`165 tok/s`) and DFlash2 parallel token verification. |
 | **`-ub 64`** | **Caps Physical Micro-Batch Size at 64.** In `Qwen3.6-35B-A3B` (256 experts, 8 active/token), the default `-ub 512` launches a single `MUL_MAT_ID` GPU kernel with `512 * 8 = 4,096` non-contiguous expert gathers across 500 MB per layer, tripping the Radeon 780M (12 CUs) MES queue watchdog (`GPU reset`). `-ub 64` keeps every kernel fast and 100% stable on long agent prompts. |
-| **`--spec-draft-n-max 12 --spec-draft-n-min 1`** | **DFlash2 Draft Block Size.** Drafts 12 tokens at once with the 545 MB sidecar and verifies them in a single forward pass of the 35B MoE model (`28 - 36.8 tok/s`). Use `12` for steady long outputs or `16` for short/medium reasoning bursts. |
+| **`--spec-draft-n-max 7 --spec-draft-n-min 1 --spec-draft-p-min 0.55`** | **DFlash2 Adaptive Draft Block.** `qwen36-35b-a3b-dflash-Q8_0.gguf` has `dflash.block_size = 8` (max `7` draft tokens). `--spec-draft-p-min 0.55` truncates low-confidence tail tokens before Radeon 780M verification, and `exp-coalesced-dflash`'s `gf_res_prev[10]` HIP graph cache keeps batch sizes `1..8` fast (**37.3 tok/s** avg, **49.2 tok/s** reasoning bursts, 100% lossless). |
 | **`-t 12`** | **Core Reservation Safeguard.** Pairs with `dspine-v2-custom`'s closed 12-thread pool (`cores 0..11`), keeping 4 hardware threads (`cores 12..15`) dedicated to Ubuntu OS, Tailscale, Docker, and `local-agent`. |
 
 ---
@@ -206,7 +229,8 @@ cmake --build build --target llama-cli llama-server -j"$(nproc)"
 
 - **[`init-repos.sh`](init-repos.sh)**: Rebuilds the 5-branch architecture (`main`, `v1-custom`, `v2-custom`, `dspine-baseline`, `dspine-v2-custom`) from `patches/v1` and `patches/v2`.
 - **[`validate-memory.sh`](validate-memory.sh)**: Compiles `v2-custom` and `dspine-v2-custom` with AddressSanitizer (`-fsanitize=address -fno-omit-frame-pointer -g -O1`) and runs `cppcheck`, `test-backend-ops -o MUL_MAT_ID`, and 16-token ASan smoke tests on both `gpt-oss-20b` (verifying `DENSE_IGPU_100PCT` CPU pool sleep) and `Qwen3.6-35B-A3B` (verifying `MOE_HYBRID_ENGAGED`).
-- **[`bench-inferssd.sh`](bench-inferssd.sh)**: Automated 5-branch benchmark suite that verifies the 40 GiB GTT limit, compiles/reuses Release builds, sweeps draft block sizes `8, 12, 16, 20`, outputs [`benchmark_results.csv`](benchmark_results.csv), and prints the final `VERDICT`.
+- **[`bench-inferssd.sh`](bench-inferssd.sh)**: Automated multi-branch benchmark suite that verifies the 40 GiB GTT limit and enforces a pre-run GTT/RAM collision safety guard (`MemAvailable >= 28 GiB`, `GTT <= 2 GiB`), sweeps real unclamped DFlash2 draft sizes `4, 5, 6, 7, 7@p0.55`, outputs [`benchmark_results.csv`](benchmark_results.csv), and prints the final `VERDICT`.
+- **[`bench-coalesced-dflash.py`](bench-coalesced-dflash.py)**: Memory-guarded warm `llama-server` 5-prompt benchmark & ablation suite for Part B (`pass1`, `pass_hipcache`, `pass_router`, `telemetry` with `LLAMA_MOE_STATS=1`).
 
 ---
 ---

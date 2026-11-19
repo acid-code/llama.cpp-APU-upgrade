@@ -1414,6 +1414,9 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_moe_topk.resize(LLAMA_MAX_LAYERS);
+    std::fill(t_moe_topk.begin(), t_moe_topk.end(), nullptr);
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1463,6 +1466,12 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             if (embeddings_layer_inp[il]) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 ggml_set_output(t_layer_inp[il]);
+            }
+        }
+        const auto & extract_moe_topk = params.cparams.extract_moe_topk;
+        for (size_t il = 0; il < extract_moe_topk.size(); ++il) {
+            if (extract_moe_topk[il] && t_moe_topk[il] != nullptr) {
+                ggml_set_output(t_moe_topk[il]);
             }
         }
     }
@@ -2365,6 +2374,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
+    if (il >= 0 && (size_t) il < res->t_moe_topk.size() &&
+            (size_t) il < cparams.extract_moe_topk.size() && cparams.extract_moe_topk[il]) {
+        res->t_moe_topk[il] = selected_experts;
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented

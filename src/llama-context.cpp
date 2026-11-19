@@ -2245,13 +2245,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
     if (layer_inp_dev && ev_layer_inp_read && ev_layer_inp_read_recorded) {
-        // do not overwrite rows the reader has not consumed yet
-        ggml_backend_event_wait(layer_inp_backend, ev_layer_inp_read.get());
+        // wait on host instead of device-side cross-stream wait to avoid RDNA3 MES queue deadlock
+        ggml_backend_event_synchronize(ev_layer_inp_read.get());
+        ev_layer_inp_read_recorded = false;
     }
 
     moe_topk_n_tokens = 0;
 
     do {
+        if (n_tokens_prev > 0) {
+            // flush previous prefill ubatch so stacked ubatches stay well within RDNA3 MES queue timeout
+            synchronize();
+        }
+
         const auto & ubatch = mctx->get_ubatch();
 
         // count the outputs in this ubatch

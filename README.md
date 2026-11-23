@@ -31,6 +31,9 @@ All model files reside in `/home/acid/projects/llama.cpp-APU-upgrade/models/`:
 | :--- | :--- | :--- | :---: | :---: |
 | **Primary MoE LLM (35B, 3B Active)** | `unsloth/Qwen3.6-35B-A3B-GGUF` (`UD-Q4_K_M`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | `20.2 GiB` | `~21.1 GiB` |
 | **DFlash2 Neural Draft Sidecar** | `aminya/Qwen3.6-35B-A3B-DFlash2-GGUF` (`Q8_0`, arch: `dflash`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/qwen36-35b-a3b-dflash-Q8_0.gguf` | `545 MiB` | `~550 MiB` |
+| **Inkling 2 Mini Mainline (26.4B)** | `unsloth/Inkling-2-Mini-GGUF` (`UD-Q4_K_XL`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/Inkling-2-Mini-UD-Q4_K_XL.gguf` | `17 GiB` | `~18 GiB` |
+| **Inkling 2 Mini DSpark Drafter** | `unsloth/Inkling-2-Mini-GGUF` (`Q8_0`, arch: `dflash`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/dspark-Inkling-2-Mini-Q8_0.gguf` | `384 MiB` | `~400 MiB` |
+| **Inkling 2 Mini Uncensored (26.4B)** | `AtomicChat/Inkling-2-Mini-Uncensored-GGUF` (`AD-Q4_K`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/Inkling-2-Mini-Uncensored-AD-Q4_K.gguf` | `16 GiB` | `~17 GiB` |
 | **Secondary / Comparison LLM (20B)** | `gpt-oss-20b-Q4_K_M` (`openai-moe`, 32 experts) | `/home/acid/projects/llama.cpp-APU-upgrade/models/gpt-oss-20b-Q4_K_M.gguf` | `11.3 GiB` | `~12.2 GiB` |
 | **Fast Agent Router / Classifier (Optional)** | `Qwen/Qwen2.5-1.5B-Instruct-GGUF` or `Qwen3-1.7B-Q8_0.gguf` | `/home/acid/projects/llama.cpp-APU-upgrade/models/qwen-router-Q8_0.gguf` | `~1.6 GiB` | `~1.8 GiB` |
 
@@ -41,6 +44,79 @@ curl -L --fail --progress-bar \
   -o /home/acid/projects/llama.cpp-APU-upgrade/models/qwen36-35b-a3b-dflash-Q8_0.gguf \
   https://huggingface.co/aminya/Qwen3.6-35B-A3B-DFlash2-GGUF/resolve/main/Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf
 ```
+
+### Inkling 2 Mini Comparison Benchmark
+
+Use [`bench-inkling-dspark.py`](bench-inkling-dspark.py) to compare Qwen3.6-35B-A3B, Inkling 2 Mini, and the uncensored Inkling 2 Mini model. The quick pass is 128 output tokens over three prompts; the full pass is 256 output tokens over five prompts:
+
+```bash
+python3 bench-inkling-dspark.py quick
+python3 bench-inkling-dspark.py full
+```
+
+The benchmark preserves the successful APU setup: full iGPU offload, native F16 KV, `-ub 64`, `-b 512`, `-t 12`, no approximate-routing hooks, and the same 128-token or 256-token generation targets used in the earlier DFlash2 comparisons. Qwen uses DFlash2 with `p_min=0.55` and tests `n_max=5/7`. The Inkling DSpark sidecar has `dflash.block_size=8` and `dflash.has_confidence_head=False`, so both Inkling variants use `p_min=0.00`; the benchmark starts with the documented `n_max=3` setting and ablates `n_max=5/7/8`.
+
+The root GGUF layout uses the looped `inkling2`/`inkling2_loop` implementation and requires looped-layer plus per-expert NVFP4-scale support. The supported DSpark path is Unsloth's llama.cpp fork/prebuilt build. Set `LLAMA_SERVER_BIN` to that build's `llama-server` before running:
+
+```bash
+QWEN_SERVER_BIN=/path/to/llama.cpp/build-dspine-v2/bin/llama-server \
+INKLING_SERVER_BIN=/path/to/unsloth-llama.cpp/build/bin/llama-server \
+LD_LIBRARY_PATH=/path/to/unsloth-llama.cpp/build/lib \
+  python3 bench-inkling-dspark.py quick
+```
+
+For mainline llama.cpp, use PR 32704 and the `Mainline_Support` GGUF variant. PR 32218 adds DSpark, but the official mainline-support guidance says that it predates and is not tested with the `inkling2_loop` layout. The benchmark therefore uses DSpark only with an Unsloth build and the root GGUF layout.
+
+---
+
+### 2026-11-22 uncensored Inkling DSpark validation
+
+A separate validation build was created outside this repository at `/home/acid/projects/llama-inkling-main`. It combines upstream PR 32704 and PR 32218 with `merge --squash` on a non-committing `inkling-dspark-validation` branch. The validation binary is `/home/acid/projects/llama-inkling-main/build/bin/llama-server`.
+
+AtomicChat's uncensored GGUF loaded with this build and the official uncensored F16 mmproj. The server logged `set_token_state: state size mismatch, got 2304 expected 6912`, so these DSpark measurements need a production fix before they are declared lossless or reliable. The uncensored model is now known to load and to produce DSpark acceptance, but the state mismatch remains a correctness risk.
+
+Measured with 128 generated tokens, coding and reasoning prompts, `-ngl 999 -ngld 999 -ub 64 -b 512 -t 12 -c 4096`, `--spec-draft-p-min 0.00`, and no other draft threshold:
+
+| Uncensored Inkling mode | Coding tok/s | Reasoning tok/s | Coding acceptance | Reasoning acceptance |
+| :--- | ---: | ---: | ---: | ---: |
+| No drafter, fresh mainline b12628 | `8.71` | `8.69` | N/A | N/A |
+| DSpark n1 p0.00 | `11.06` | `10.79` | `65.8%` | `61.5%` |
+| DSpark n2 p0.00 | `10.07` | `9.96` | `49.6%` | `48.8%` |
+| DSpark n3 p0.00 | `8.78` | `8.57` | `38.9%` | `37.1%` |
+
+Best result: `n1` improved the uncensored fallback from about `8.69-8.71` tok/s to `10.79-11.06` tok/s in this two-prompt smoke test.
+
+The result is not final validation because the merged build emitted the `2304/6912` state-size mismatch. The mismatch must be reproduced and fixed in PR 32218/32704 integration before enabling DSpark as the uncensored local-agent fallback.
+
+Official uncensored run command:
+
+```bash
+HSA_OVERRIDE_GFX_VERSION=11.0.0 \
+HIP_VISIBLE_DEVICES=0 \
+/home/acid/projects/llama-inkling-main/build/bin/llama-server \
+  -m /home/acid/projects/llama.cpp-APU-upgrade/models/Inkling-2-Mini-Uncensored-AD-Q4_K.gguf \
+  --mmproj /home/acid/projects/llama.cpp-APU-upgrade/models/mmproj-Inkling-2-Mini-Uncensored-F16.gguf \
+  -ngl 999 -fit off -lm none -fa on -ub 64 -b 512 -t 12 -c 32768 \
+  --jinja --host 0.0.0.0 --port 8081
+```
+
+Experimental uncensored DSpark command:
+
+```bash
+HSA_OVERRIDE_GFX_VERSION=11.0.0 \
+HIP_VISIBLE_DEVICES=0 \
+/home/acid/projects/llama-inkling-main/build/bin/llama-server \
+  -m /home/acid/projects/llama.cpp-APU-upgrade/models/Inkling-2-Mini-Uncensored-AD-Q4_K.gguf \
+  --mmproj /home/acid/projects/llama.cpp-APU-upgrade/models/mmproj-Inkling-2-Mini-Uncensored-F16.gguf \
+  -md /home/acid/projects/llama.cpp-APU-upgrade/models/dspark-Inkling-2-Mini-Q8_0.gguf \
+  --spec-type draft-dspark --spec-draft-n-max 1 --spec-draft-n-min 1 --spec-draft-p-min 0.00 \
+  -ngl 999 -ngld 999 -fit off -lm none -fa on -ub 64 -b 512 -t 12 -c 32768 \
+  --jinja --host 0.0.0.0 --port 8081
+```
+
+Copy-ready prompt for local-agent/Copilot:
+
+> Add Inkling 2 Mini Uncensored as a local-agent fallback. Keep Qwen3.6-35B-A3B with DFlash2 as the primary server. Use the separate `/home/acid/projects/llama-inkling-main/build/bin/llama-server` binary because it contains native Inkling loop support and the DSpark validation merge. Run the baked uncensored GGUF at `/home/acid/projects/llama.cpp-APU-upgrade/models/Inkling-2-Mini-Uncensored-AD-Q4_K.gguf` with `/home/acid/projects/llama.cpp-APU-upgrade/models/mmproj-Inkling-2-Mini-Uncensored-F16.gguf` on port 8081. Start without a drafter for a known-compatible production fallback. Use DSpark only experimentally with `--spec-type draft-dspark --spec-draft-n-max 1 --spec-draft-n-min 1 --spec-draft-p-min 0.00`; do not enable it until the `2304/6912` state-size mismatch is fixed and verified lossless. Preserve the existing Qwen server on port 8080 with `-ngl 999 -fit off -lm none -fa on -ub 64 -b 512 -t 12 -c 32768 -np 1 --spec-draft-n-max 7 --spec-draft-n-min 1 --spec-draft-p-min 0.55`.
 
 ---
 
@@ -289,6 +365,45 @@ cmake --build build --target llama-cli llama-server -j"$(nproc)"
 - **[`validate-memory.sh`](validate-memory.sh)**: Compiles `v2-custom` and `dspine-v2-custom` with AddressSanitizer (`-fsanitize=address -fno-omit-frame-pointer -g -O1`) and runs `cppcheck`, `test-backend-ops -o MUL_MAT_ID`, and 16-token ASan smoke tests on both `gpt-oss-20b` (verifying `DENSE_IGPU_100PCT` CPU pool sleep) and `Qwen3.6-35B-A3B` (verifying `MOE_HYBRID_ENGAGED`).
 - **[`bench-inferssd.sh`](bench-inferssd.sh)**: Automated multi-branch benchmark suite that verifies the 40 GiB GTT limit and enforces a pre-run GTT/RAM collision safety guard (`MemAvailable >= 28 GiB`, `GTT <= 2 GiB`), sweeps real unclamped DFlash2 draft sizes `4, 5, 6, 7, 7@p0.55`, outputs [`benchmark_results.csv`](benchmark_results.csv), and prints the final `VERDICT`.
 - **[`bench-coalesced-dflash.py`](bench-coalesced-dflash.py)**: Memory-guarded warm `llama-server` 5-prompt benchmark & ablation suite for Part B (`pass1`, `pass_hipcache`, `pass_router`, `telemetry` with `LLAMA_MOE_STATS=1`).
+- **[`bench-inkling-dspark.py`](bench-inkling-dspark.py)**: Cross-model benchmark for Qwen3.6-35B-A3B and the Inkling 2 Mini mainline and uncensored GGUFs. It supports separate Qwen and Inkling server binaries.
+
+### Inkling 2 Mini benchmark changes
+
+Added the Inkling 2 Mini model, DSpark drafter, and uncensored GGUF paths in this repository on 2026-11-22.
+
+The quick benchmark used the custom `build-dspine-v2` binary for Qwen and Unsloth's `b12588-mix-c0c3de8` gfx110X prebuilt for Inkling. Qwen DFlash2 used `n_max=5/7` and `p_min=0.55`; Inkling DSpark used `n_max=3/5/7/8` and `p_min=0.00`.
+
+Results:
+
+| Configuration | Average decode |
+| :--- | ---: |
+| Qwen3.6 no drafter | `18.44 tok/s` |
+| Qwen3.6 DFlash2 n5 p0.55 | `39.32 tok/s` |
+| Qwen3.6 DFlash2 n7 p0.55 | `40.81 tok/s` |
+| Inkling 2 Mini no drafter | `9.69 tok/s` |
+| Inkling 2 Mini DSpark n3 p0.00 | `8.42 tok/s` |
+| Inkling 2 Mini DSpark n5 p0.00 | `7.70 tok/s` |
+| Inkling 2 Mini DSpark n7 p0.00 | `6.94 tok/s` |
+| Inkling 2 Mini DSpark n8 p0.00 | `6.96 tok/s` |
+| Inkling 2 Mini Uncensored no drafter | `8.69-8.71 tok/s` |
+
+Inkling DSpark did not improve this APU's 128-token benchmark. Acceptance fell from `44.7%` at n3 to `24.1%` at n7/n8, while larger verification blocks were slower.
+
+The uncensored GGUF uses `inkling2_loop` and was rejected by the b12588 Unsloth prebuilt. It needs a fresh mainline llama.cpp build with native `inkling2_loop` support. Using root-layout Qwen DFlash2 as an Inkling drafter crashed during DFlash graph construction and is unsupported.
+
+Planned follow-up tests:
+
+- Build fresh mainline llama.cpp outside this repository for native `inkling2_loop` support.
+- Completed: fresh mainline b12628 loads the uncensored `inkling2_loop` GGUF and F16 mmproj at 8.69-8.71 tok/s with no drafter.
+- Blocked: the published DSpark drafter has `markov_w1.weight` shape 256 x 200058, while the uncensored target expects a 201024-token vocabulary. DSpark rejects the uncensored target as incompatible.
+- Required: an uncensored-compatible DSpark export, or a vocab-remapped drafter, is needed before n1/n2/n3 can be measured safely.
+- Run AtomicChat's uncensored GGUF with the matching F16 mmproj and no drafter.
+- Test DSpark on the uncensored and mainline models with `n_max=1/2/3` and `p_min=0.55`.
+- Test `UD-IQ3_XXS` or `UD-Q3_K_XL` to measure the lower-bandwidth quantization tradeoff.
+- Test the variable-loop 2-pass checkpoint if it becomes available.
+- Use MoE telemetry to verify expert union growth instead of relying only on the DDR5 bandwidth explanation.
+
+The Qwen local-agent server is restored with the custom `build-dspine-v2` binary and DFlash2. Verify it with `curl http://127.0.0.1:8080/health`.
 
 ---
 ---

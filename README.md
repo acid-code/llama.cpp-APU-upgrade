@@ -30,7 +30,10 @@ All model files reside in `/home/acid/projects/llama.cpp-APU-upgrade/models/`:
 | Role | Model Name / Hugging Face Repo | Exact File Path on `mini-pc` | Disk Size | GTT / RAM Footprint |
 | :--- | :--- | :--- | :---: | :---: |
 | **Primary MoE LLM (35B, 3B Active)** | `unsloth/Qwen3.6-35B-A3B-GGUF` (`UD-Q4_K_M`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | `20.2 GiB` | `~21.1 GiB` |
+| **Secondary Qwen3.6 Fallback (35B, 3B Active)** | `HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive` (`Q4_K_M` + `mmproj-f16`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf` | `19.7 GiB` + `858 MiB` | `~22.5 GiB` *(32K ctx)* |
 | **DFlash2 Neural Draft Sidecar** | `aminya/Qwen3.6-35B-A3B-DFlash2-GGUF` (`Q8_0`, arch: `dflash`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/qwen36-35b-a3b-dflash-Q8_0.gguf` | `545 MiB` | `~550 MiB` |
+| **Flint Coding MoE (39.8B, 2.5B Active)** | `mradermacher/Flint-40B-A2.5B-abliterated-i1-GGUF` (`i1-IQ4_XS`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/flint-abliterated/mrad-i1-IQ4_XS.gguf` | `19.9 GiB` | `~21.3 GiB` *(32K ctx)* |
+| **Flint DFlash2 Neural Draft Sidecar** | `z-lab/Flint-DFlash2` (`Q8_0`, arch: `dflash`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/Flint-DFlash2-Q8_0.gguf` | `414 MiB` | `~450 MiB` |
 | **Inkling 2 Mini Mainline (26.4B)** | `unsloth/Inkling-2-Mini-GGUF` (`UD-Q4_K_XL`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/Inkling-2-Mini-UD-Q4_K_XL.gguf` | `17 GiB` | `~18 GiB` |
 | **Inkling 2 Mini DSpark Drafter** | `unsloth/Inkling-2-Mini-GGUF` (`Q8_0`, arch: `dflash`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/dspark-Inkling-2-Mini-Q8_0.gguf` | `384 MiB` | `~400 MiB` |
 | **Inkling 2 Mini Uncensored (26.4B)** | `AtomicChat/Inkling-2-Mini-Uncensored-GGUF` (`AD-Q4_K`) | `/home/acid/projects/llama.cpp-APU-upgrade/models/Inkling-2-Mini-Uncensored-AD-Q4_K.gguf` | `16 GiB` | `~17 GiB` |
@@ -86,9 +89,62 @@ Measured with 128 generated tokens, coding and reasoning prompts, `-ngl 999 -ngl
 
 Best result: `n1` improved the uncensored fallback from about `8.69-8.71` tok/s to `10.79-11.06` tok/s in this two-prompt smoke test.
 
-The result is not final validation because the merged build emitted the `2304/6912` state-size mismatch. The mismatch must be reproduced and fixed in PR 32218/32704 integration before enabling DSpark as the uncensored local-agent fallback.
+**2026-11-23 fix & unified mainline validation (`bench-unified-models.py`):**
+- **Root cause of `2304 / 6912` fixed:** `common_batch_set_zero_state()` in `/home/acid/projects/llama-inkling-main/common/common.cpp` (startup warmup & `seq_rm` probe only) hardcoded `llama_model_n_embd_out(model)` (`2304`) instead of querying `n_embd_state` (`3 * 2304 = 6912` for `dspark_context_rank`). Exposed `llama_n_embd_state(ctx)` and updated `common_batch_set_zero_state()`, eliminating all `state size mismatch` errors (`0` across all 9 runs).
+- **Unified mainline build:** Ported `gf_res_prev[10]`, RDNA3 `gfx1103` host-sync on `ev_layer_inp_read` + `ev_h_nextn_read` / prefill ubatch flush, and opt-in `llama-approx-routing.{h,cpp}` onto `/home/acid/projects/llama-inkling-main` (`v1.0.0-dev` / `b12629` + PR 32704 + PR 32218).
+- **Unified 3-prompt benchmark (`bench_unified_quick.csv`, 128 tok, `-ngl 999 -fit off -lm none -fa on -ub 64 -b 512 -t 12 -c 4096 -np 1`, `0` GPU resets, `0/0` graph reallocs, `0` state mismatches):**
 
-Official uncensored run command:
+| Unified Mainline `b12629` Config | Avg PP (`tok/s`) | Avg Decode (`tok/s`) | DFlash/DSpark Acc | Mean Len | GTT (`GiB`) | Notes |
+| :--- | ---: | ---: | ---: | ---: | ---: | :--- |
+| **`Qwen3.6-35B-A3B Q4_K_M` + `DFlash2 n7 p0.55`** | `114.5` | **`38.98`** | `76.2%` | `4.28` | `21.5` | **#1 daily driver** (`40.33 tok/s` reasoning, `0/0` reallocs) |
+| **`Flint 39.8B-A2.5B UD-Q4_K_XL` (no draft)** | `111.0` | `22.45` | N/A | `1.00` | `23.4` | Fastest raw MoE (2.16x Inkling Q4 raw, +17% over Qwen3.6 raw) |
+| `Flint 39.8B-A2.5B UD-Q4_K_XL` + `Flint-DFlash2 n7 p0.00` | `99.3` | `21.88` | `26.8%` | `2.77` | `23.9` | Naive `p_min=0` slower than raw on DDR5 (`-2.5%`) |
+| **`Flint 39.8B-A2.5B UD-Q4_K_XL` + `Flint-DFlash2 n7 p0.60`** | `109.7` | **`33.51`** | `62.8%` | `2.87` | `23.9` | **+49.3% vs raw (`36.20 tok/s` coding)**, `0/0` reallocs via `gf_res_prev[10]` |
+| `Inkling-2-Mini Q4_K_XL` (mainline, no draft) | `44.8` | `10.38` | N/A | `1.00` | `16.6` | +7.1% over Unsloth `b12588` (`9.69`) |
+| `Inkling-2-Mini Q4_K_XL` + `DSpark n1` | `45.2` | **`11.23`** | `65.7%` | `1.65` | `17.0` | **+8.2%**, `0` state mismatch |
+| `Inkling-2-Mini Q4_K_XL` + `DSpark n2` | `43.2` | `9.82` | `46.6%` | `1.91` | `17.0` | Slower on DDR5 (`193` vs `145 ms/step`) |
+| `Inkling-2-Mini Uncensored AD-Q4_K` (no draft) | `58.3` | `9.30` | N/A | `1.00` | `15.5` | Baseline uncensored fallback |
+| **`Inkling-2-Mini Uncensored AD-Q4_K` + `DSpark n1`** | `59.7` | **`11.16`** | `61.7%` | `1.60` | `15.9` | **+20.0%**, `0` state mismatch, `2/3` exact SHA match |
+| `Inkling-2-Mini Q3_K_XL` (mainline, no draft) | `47.0` | `11.62` | N/A | `1.00` | `13.0` | +11.9% over Q4 raw; **`reasoning_effort="low"` cut wall-clock 3.25x (`45.5 s -> 14.0 s`)** |
+| **`Inkling-2-Mini Q3_K_XL` + `DSpark n1`** | `47.0` | **`12.58`** | `64.5%` | `1.63` | `13.4` | **+21.2% over Q4 raw** (`13.18 tok/s` reasoning) |
+
+**2026-11-23 Abliterated Flint (`dima6312/Flint-40B-A2.5B-abliterated`) + `Flint-DFlash2` Quant & Sweet-Spot Sweep (`bench-flint-abliterated.py` / `bench_flint_abliterated.csv`):**
+- Both `dima6312` (plain GGUF) and `mradermacher` (`i1` imatrix GGUF) quantize `dima6312/Flint-40B-A2.5B-abliterated` (`MITRE ATT&CK` refusal rate `15% -> 0%`). Tested across 24 configs (`3` prompts x `128` tok, `-c 4096 -ub 64 -np 1`, `0` GPU resets, `0/0` graph reallocs), plus qualitative coherence + non-refusal verification:
+
+| Abliterated Flint Quant | Disk (`GiB`) | GTT (`GiB`) | Raw Decode | Best `Flint-DFlash2` Config | Best Decode | Acc% | Mean Len | Quality Check (`[sec_ctf]` + `[code]`) |
+| :--- | ---: | ---: | ---: | :--- | ---: | ---: | ---: | :--- |
+| `dima-Q4_K_M` (plain) | `22.5` | `23.2` | `25.53` | `n7 p0.65` (`n7 p0.60`: `33.63`) | `33.65` | `68.1%` | `2.31` | Slight clipped CoT (`37.45` code / `29.12` ctf) |
+| `mrad-i1-Q4_K_M` (imatrix) | `22.5` | `23.2` | `31.68` | `n6 p0.60` (`n7 p0.60`: `32.89`) | `34.29` | `64.5%` | `2.43` | Slower than `i1-IQ4_XS`, higher GTT |
+| **`mrad-i1-IQ4_XS` (imatrix) - WINNER** | **`19.9`** | **`20.6`** | **`33.54`** | **`n6 p0.65`** (`n5 p0.60`: `37.02`) | **`38.10`** | **`68.8%`** | **`2.44`** | **Clean fluent English CoT (`40.49` code / `32.95` ctf; `45.15` binary-search smoke test at 32K ctx)** |
+| `mrad-i1-Q3_K_M` (imatrix) | `17.8` | `18.5` | `36.07` | `n7 p0.65` (`n7 p0.70`: `44.72`) | `45.89` | `75.7%` | `3.23` | **Degraded CoT grammar** (`"We need answer user..."`) |
+
+- **2026-11-23 `Qwen3.6-35B-A3B` (`HauhauCS` `Q4_K_M`) + `DFlash2` Sweep (`bench-qwen36-uncensored.py` / `bench_qwen36_uncensored.csv`):**
+  - Replaces Inkling and Flint on `:8081` purely on APU throughput and draft efficiency: **`46.68 tok/s`** average decode with `qwen36-35b-a3b-dflash-Q8_0.gguf` (**4.2x faster than Inkling-2-Mini + DSpark at `11.16 tok/s`**, `0/0` graph reallocs, 100% lossless match vs raw, `22.5 GiB` GTT at `-c 32768`):
+
+| `Qwen3.6-35B-A3B` (`Q4_K_M`) Config | Avg PP (`tok/s`) | Avg Decode (`tok/s`) | vs Raw | DFlash2 Acc | Mean Len | GTT (`GiB`) | Notes |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| `nodraft` (raw baseline) | `131.9` | `25.08` | `+0.0%` | `0.0%` | `1.00` | `19.85` | `0/0` reallocs |
+| **`dflash2_n7_p55` - WINNER** | **`130.9`** | **`46.68`** | **`+86.1%`** | **`82.2%`** | **`5.69`** | **`22.24`** | **4.2x faster than Inkling (`11.16`), peak `49.54 tok/s`, `0/0` reallocs** |
+| `dflash2_n7_p60` | `132.3` | `46.42` | `+85.1%` | `83.5%` | `6.21` | `22.11` | Virtually tied with `p0.55` |
+| `dflash2_n5_p55` | `133.4` | `44.24` | `+76.4%` | `86.9%` | `5.02` | `21.97` | Higher acc%, slightly shorter burst |
+| `dflash2_n7_p50` | `126.7` | `43.69` | `+74.2%` | `81.3%` | `6.29` | `25.87` | Lower threshold hurts speed slightly |
+
+Secondary fallback command (`:8081`, `Qwen3.6-35B-A3B` `Q4_K_M` + `DFlash2`):
+
+```bash
+LD_LIBRARY_PATH=/opt/llama-server/uncensored-bin \
+HSA_OVERRIDE_GFX_VERSION=11.0.0 \
+HIP_VISIBLE_DEVICES=0 \
+/opt/llama-server/uncensored-bin/llama-server \
+  -m /opt/llama-server/models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf \
+  --mmproj /opt/llama-server/models/mmproj-Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-f16.gguf \
+  -md /opt/llama-server/models/qwen36-35b-a3b-dflash-Q8_0.gguf \
+  --spec-draft-n-max 7 --spec-draft-n-min 1 --spec-draft-p-min 0.55 \
+  -ngl 999 -ngld 999 -fit off -lm none -fa on -ub 64 -b 512 -t 12 -c 32768 -np 1 \
+  -a qwen3.6-35b-a3b-uncensored --jinja --host 0.0.0.0 --port 8081
+```
+
+Legacy Inkling fallback command:
 
 ```bash
 HSA_OVERRIDE_GFX_VERSION=11.0.0 \

@@ -1,0 +1,6 @@
+config,avg_pp_tps,avg_dec_tps,vs_raw_pct,avg_acc_pct,avg_len,gtt_gib,reallocs
+nodraft_nommproj,131.93,25.08,+0.00,0.00,1.00,19.85,0
+dflash2_n7_p55_mmproj,130.87,46.68,+86.12,82.25,5.69,22.24,0
+dflash2_n7_p60_mmproj,132.33,46.42,+85.09,83.46,6.21,22.11,0
+dflash2_n7_p50_mmproj,126.71,43.69,+74.20,81.34,6.29,25.87,0
+dflash2_n5_p55_mmproj,133.44,44.24,+76.40,86.89,5.02,21.97,0

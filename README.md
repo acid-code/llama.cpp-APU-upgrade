@@ -108,6 +108,8 @@ Best result: `n1` improved the uncensored fallback from about `8.69-8.71` tok/s 
 | `Inkling-2-Mini Q3_K_XL` (mainline, no draft) | `47.0` | `11.62` | N/A | `1.00` | `13.0` | +11.9% over Q4 raw; **`reasoning_effort="low"` cut wall-clock 3.25x (`45.5 s -> 14.0 s`)** |
 | **`Inkling-2-Mini Q3_K_XL` + `DSpark n1`** | `47.0` | **`12.58`** | `64.5%` | `1.63` | `13.4` | **+21.2% over Q4 raw** (`13.18 tok/s` reasoning) |
 
+> **Long-Context Regression Warning (2026-11-24 — see Section 4.2.1):** While `b12629` (`v1.0.0-dev`) passed the 4K-context `bench_unified_quick.csv` sweep above, subsequent long-context testing uncovered a `b12217 -> b12629` regression in `LLAMA_DFLASH_DEV=1` on `gfx1103` that causes all-`NaN` logits at `>=12K` tokens on `Qwen3.6-35B-A3B-UD-Q4_K_M` + `DFlash2` and ~11–14% slower long-context prefill than `b12217`. Keep `:8080` (`Qwen3.6-35B-A3B-UD-Q4_K_M`) on **`b12217` (`build-dspine-v2`, `19e225579`)**.
+
 **2026-11-23 Abliterated Flint (`dima6312/Flint-40B-A2.5B-abliterated`) + `Flint-DFlash2` Quant & Sweet-Spot Sweep (`bench-flint-abliterated.py` / `bench_flint_abliterated.csv`):**
 - Both `dima6312` (plain GGUF) and `mradermacher` (`i1` imatrix GGUF) quantize `dima6312/Flint-40B-A2.5B-abliterated` (`MITRE ATT&CK` refusal rate `15% -> 0%`). Tested across 24 configs (`3` prompts x `128` tok, `-c 4096 -ub 64 -np 1`, `0` GPU resets, `0/0` graph reallocs), plus qualitative coherence + non-refusal verification:
 
@@ -128,6 +130,8 @@ Best result: `n1` improved the uncensored fallback from about `8.69-8.71` tok/s 
 | `dflash2_n7_p60` | `132.3` | `46.42` | `+85.1%` | `83.5%` | `6.21` | `22.11` | Virtually tied with `p0.55` |
 | `dflash2_n5_p55` | `133.4` | `44.24` | `+76.4%` | `86.9%` | `5.02` | `21.97` | Higher acc%, slightly shorter burst |
 | `dflash2_n7_p50` | `126.7` | `43.69` | `+74.2%` | `81.3%` | `6.29` | `25.87` | Lower threshold hurts speed slightly |
+
+> **Note:** The `46.68 tok/s` sweep (`bench_qwen36_uncensored.csv`) was measured on `b12629` at `-c 4096`; a head-to-head `b12217` vs `b12629` comparison (4K decode + 12.7K/18.4K long-context + `mmproj`) is still pending (`b12217`'s `libmtmd.so` already supports `qwen3vl_merger`).
 
 Secondary fallback command (`:8081`, `Qwen3.6-35B-A3B` `Q4_K_M` + `DFlash2`):
 
@@ -251,6 +255,30 @@ Measured on `Qwen3.6-35B-A3B` + `DFlash2` (`-c 32768 -np 1 -fa on -ub 64 -b 512 
   1. **Do NOT use `-ctk q8_0 -ctv q8_0` on `Qwen3.6-35B-A3B` + `DFlash2`:** Only 10/40 layers use attention (Gated DeltaNet), so native F16 KV at `-c 32768` uses only `~640 MiB`. Enabling `q8_0` KV forces `ggml-cuda/fattn.cu` `BEST_FATTN_KERNEL_MMA_F16` (`DKQ=256, gqa=8, n_tokens >= 3`) to dequantize K/V into temporary F16 buffers on every step, dropping 18K-22K decode from **`25.0-25.6 tok/s`** down to `~19.2 tok/s`.
   2. **Prefix caching (`cache_prompt=true` + `-np 1`) cuts 18.7K TTFT by 96x (`105.8 s -> 1.10 s`):** Keep system prompt and repo context prefixes stable across turns and set client HTTP timeout >= `300 s` for cold 16K-24K Turn-1 prefills.
   3. **`amdgpu.cwsr_enable=0` in GRUB is mandatory on `gfx1103`:** Eliminated recurring `MES failed to respond to msg=REMOVE_QUEUE` / `Failed to evict queue 3` GPU resets when `ctx_tgt` (queue 2) and `ctx_dft` (queue 3) run long multi-turn sessions.
+
+### 4.2.1 Long-Context `b12217` vs `b12629` Regression & `DFlash2` Isolation Benchmark (2026-11-24)
+
+Tested on cold `llama-server` instances (Request #1 unless noted, greedy `temp=0`, `cache_prompt=false`, `logprobs=true`, `-ngl 999 -ngld 999 -fit off -lm none -fa on -ub 64 -b 512 -t 12 -c 32768 -np 1 --spec-draft-n-max 7 --spec-draft-n-min 1 --spec-draft-p-min 0.55`):
+
+| Binary | Model | `-md` DFlash2 | `LLAMA_DFLASH_DEV` | HIP Graphs | Prompt | Result |
+| :--- | :--- | :---: | :---: | :---: | :--- | :--- |
+| `b12629` (`llama-inkling-main`, `1fb8a2696`) | `UD-Q4_K_M` | ON | `1` (default) | ON | `14,319` tok (synthetic 560-para) | **PASS** (`106.1 s`, coherent) |
+| `b12629` | `UD-Q4_K_M` | ON | `1` (default) | ON | `12,732` tok (real README slice, Req #1) | **`NaN` (`////////////`, `78.2 s`; `76.9 s` as Req #2)** |
+| `b12629` | `UD-Q4_K_M` | ON | `1` (default) | OFF (`GGML_CUDA_DISABLE_GRAPHS=1`) | `12,732` tok (Req #1) | **`NaN` (`////////////`, `77.6 s`)** |
+| `b12629` | `UD-Q4_K_M` | **OFF** | — | ON | `12,732` tok (Req #1) | **PASS** (`77.5 s`, coherent) |
+| `b12629` | `UD-Q4_K_M` | ON | **`0`** (host copy) | ON | `12,732` tok (Req #1) | **PASS** (`80.1 s`, coherent) |
+| **`b12217` (`build-dspine-v2`, `19e225579`)** | **`UD-Q4_K_M`** | **ON** | **`1`** (default) | **ON** | **`12,732` tok (Req #1)** | **PASS (`68.9 s`, coherent — 14.0% faster than `b12629` `DEV=0`, 11.1% faster than `b12629` no-draft)** |
+| **`b12217` (`build-dspine-v2`, `19e225579`)** | **`UD-Q4_K_M`** | **ON** | **`1`** (default) | **ON** | **Full `18,354` tok README (Req #1)** | **PASS (`103.3 s`, coherent)** |
+| `b12629` | `Uncensored-HauhauCS-Q4_K_M` | ON | `1` (default) | ON | `12,732` tok (Req #1) | **PASS** (`72.8 s`, coherent; *not yet tested on `b12217` or at `18K+`*) |
+
+- **Root Cause:**
+  - `b12217 -> b12629` regression in `LLAMA_DFLASH_DEV=1` device-buffer feature extraction (`build_layer_inp_dev()` + `ggml_set_rows` in `src/llama-graph.cpp` / `ggml/src/ggml-cuda/set-rows.cu`) on RDNA3 HIP (`gfx1103`).
+  - Produces all-`NaN` logits (`"logprob": null` on every token), `0.00%` DFlash2 acceptance, and deterministic repetition of token `14` (`"/"`) or `18` (`"3"`). Not an OOM and not a sampling bug.
+
+- **Guidance for Future Model & Build Decisions:**
+  1. **Binary selection:** Keep `Qwen3.6-35B-A3B-UD-Q4_K_M` + `DFlash2` on **`b12217` (`build-dspine-v2`)**. Reserve `b12629` for architectures/features `b12217` lacks (e.g., `inkling2_loop` / `DSpark`); if running `b12629` + `DFlash2` on long contexts and `NaN`s appear, set `LLAMA_DFLASH_DEV=0` as a workaround.
+  2. **Mandatory pre-deployment validation gate:** Never promote a new `llama.cpp` build or GGUF based solely on 4K-context benchmarks or synthetic repetitive prompts. Always run a cold Request #1 realistic dense prompt (`>= 12K–18K` tokens, `cache_prompt=false`, `logprobs=true`) with `-md` active and assert `logprob != null` (no `NaN`s), coherent output, and non-regressed prefill wall time.
+  3. **Pending check:** Benchmark `Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M` + `mmproj` (`qwen3vl_merger`, already supported in `b12217`'s `libmtmd.so`) + `DFlash2` head-to-head on `b12217` vs `b12629` across 4K decode and 12.7K / 18.4K long-context prompts.
 
 ### 4.3 Part A: Similarity-Bounded Cold-Expert Substitution (`exp-approx-routing`)
 Opt-in MoE routing hook (`src/llama-approx-routing.{h,cpp}`, controlled by `LLAMA_APPROX_ROUTING`, zero overhead when unset) that computes per-layer mean-centered router cosine similarity from `blk.<L>.ffn_gate_inp.weight` and redirects cold low-weight tail experts (`w_rel < tau`, `protect_top=1`) to their highest-similarity distinct resident neighbor (`sim >= delta`).

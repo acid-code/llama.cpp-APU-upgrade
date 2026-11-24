@@ -131,7 +131,7 @@ Best result: `n1` improved the uncensored fallback from about `8.69-8.71` tok/s 
 | `dflash2_n5_p55` | `133.4` | `44.24` | `+76.4%` | `86.9%` | `5.02` | `21.97` | Higher acc%, slightly shorter burst |
 | `dflash2_n7_p50` | `126.7` | `43.69` | `+74.2%` | `81.3%` | `6.29` | `25.87` | Lower threshold hurts speed slightly |
 
-> **Note:** The `46.68 tok/s` sweep (`bench_qwen36_uncensored.csv`) was measured on `b12629` at `-c 4096`; a head-to-head `b12217` vs `b12629` comparison (4K decode + 12.7K/18.4K long-context + `mmproj`) is still pending (`b12217`'s `libmtmd.so` already supports `qwen3vl_merger`).
+> **Note (`b12217` vs `b12629`, updated 2026-11-24):** The `46.68 tok/s` sweep (`bench_qwen36_uncensored.csv`) originally ran on `b12629` at `-c 4096`. Head-to-head testing in **Section 4.2.1** now confirms `b12217` (`build-dspine-v2`) with `mmproj` + `DFlash2` wins across the board on `Qwen3.6-35B-A3B-Uncensored` too: **`46.75` vs `43.04 tok/s`** at 4K (`+8.6%`), **`+27–36%` faster prefill** at `18.5K–25.6K`, and `26.2%` faster total wall time at `25.6K` (`136.4 s` vs `184.9 s`), with working `mmproj` vision and zero `NaN`s.
 
 Secondary fallback command (`:8081`, `Qwen3.6-35B-A3B` `Q4_K_M` + `DFlash2`):
 
@@ -269,7 +269,16 @@ Tested on cold `llama-server` instances (Request #1 unless noted, greedy `temp=0
 | `b12629` | `UD-Q4_K_M` | ON | **`0`** (host copy) | ON | `12,732` tok (Req #1) | **PASS** (`80.1 s`, coherent) |
 | **`b12217` (`build-dspine-v2`, `19e225579`)** | **`UD-Q4_K_M`** | **ON** | **`1`** (default) | **ON** | **`12,732` tok (Req #1)** | **PASS (`68.9 s`, coherent — 14.0% faster than `b12629` `DEV=0`, 11.1% faster than `b12629` no-draft)** |
 | **`b12217` (`build-dspine-v2`, `19e225579`)** | **`UD-Q4_K_M`** | **ON** | **`1`** (default) | **ON** | **Full `18,354` tok README (Req #1)** | **PASS (`103.3 s`, coherent)** |
-| `b12629` | `Uncensored-HauhauCS-Q4_K_M` | ON | `1` (default) | ON | `12,732` tok (Req #1) | **PASS** (`72.8 s`, coherent; *not yet tested on `b12217` or at `18K+`*) |
+| `b12629` | `Uncensored-HauhauCS-Q4_K_M` | ON | `1` (default) | ON | `12,732` tok (Req #1) | **PASS** (`72.8 s`, coherent; *see head-to-head below for `4K / 18.5K / 25.6K`*) |
+
+**`Qwen3.6-35B-A3B-Uncensored` (`HauhauCS Q4_K_M` + `mmproj-f16` + `DFlash2 n7 p0.55`) Head-to-Head (`b12217` vs `b12629`, 2026-11-24):**
+
+| Test Case (Cold Server, `temp=0`, `cache_prompt=false`, `0` Reallocs) | `b12217` (`build-dspine-v2`) | `b12629` (`llama-inkling-main`) | `b12217` Delta |
+| :--- | :--- | :--- | :--- |
+| **4K 3-Prompt Avg** (`code`, `reasoning`, `sec_ctf`, `mean len 5.52/5.55`) | **`46.75 tok/s`** dec · `121.46 tok/s` PP · `82.25%` acc · `22.06 GiB` | `43.04 tok/s` dec · `121.68 tok/s` PP · `82.25%` acc · `22.16 GiB` | **`+8.6%` decode** (`NaN=False`) |
+| **Vision `mmproj-f16`** (`127` tok image + text, `64` gen) | **`3.23 s`** wall · `117.90 tok/s` PP · `29.79 tok/s` dec (`NaN=False`) | `3.29 s` wall · `110.21 tok/s` PP · `30.14 tok/s` dec (`NaN=False`) | **`+7.0%` PP**, `mmproj` verified |
+| **Cold `18,492` tok (`~18.5K`, `-c 32768`)** | **`95.25 s`** wall · **`202.86 tok/s`** PP · **`31.29 tok/s`** dec · `77.24%` acc · `26.40 GiB` | `119.95 s` wall · `159.79 tok/s` PP · `30.63 tok/s` dec · `79.03%` acc · `26.33 GiB` | **`+27.0%` PP, `-20.6%` wall** (`NaN=False`) |
+| **Cold `25,595` tok (`~25.6K`, `-c 32768`)** | **`136.39 s`** wall · **`194.28 tok/s`** PP · **`27.64 tok/s`** dec · `69.23%` acc · `26.41 GiB` | `184.90 s` wall · `142.49 tok/s` PP · `24.37 tok/s` dec · `66.42%` acc · `26.48 GiB` | **`+36.3%` PP, `+13.4%` dec, `-26.2%` wall** (`NaN=False`) |
 
 - **Root Cause:**
   - `b12217 -> b12629` regression in `LLAMA_DFLASH_DEV=1` device-buffer feature extraction (`build_layer_inp_dev()` + `ggml_set_rows` in `src/llama-graph.cpp` / `ggml/src/ggml-cuda/set-rows.cu`) on RDNA3 HIP (`gfx1103`).
@@ -278,7 +287,7 @@ Tested on cold `llama-server` instances (Request #1 unless noted, greedy `temp=0
 - **Guidance for Future Model & Build Decisions:**
   1. **Binary selection:** Keep `Qwen3.6-35B-A3B-UD-Q4_K_M` + `DFlash2` on **`b12217` (`build-dspine-v2`)**. Reserve `b12629` for architectures/features `b12217` lacks (e.g., `inkling2_loop` / `DSpark`); if running `b12629` + `DFlash2` on long contexts and `NaN`s appear, set `LLAMA_DFLASH_DEV=0` as a workaround.
   2. **Mandatory pre-deployment validation gate:** Never promote a new `llama.cpp` build or GGUF based solely on 4K-context benchmarks or synthetic repetitive prompts. Always run a cold Request #1 realistic dense prompt (`>= 12K–18K` tokens, `cache_prompt=false`, `logprobs=true`) with `-md` active and assert `logprob != null` (no `NaN`s), coherent output, and non-regressed prefill wall time.
-  3. **Pending check:** Benchmark `Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M` + `mmproj` (`qwen3vl_merger`, already supported in `b12217`'s `libmtmd.so`) + `DFlash2` head-to-head on `b12217` vs `b12629` across 4K decode and 12.7K / 18.4K long-context prompts.
+  3. **Uncensored Qwen3.6 verdict (`2026-11-24`):** Although `b12629` did not hit `NaN` on `Uncensored-HauhauCS-Q4_K_M` up to `25.6K` tokens, **`b12217` is strictly faster at every context length** (`+8.6%` 4K decode, `+27–36%` long-context prefill, `-26.2%` wall time at `25.6K`) and supports `mmproj` (`qwen3vl_merger`) cleanly, making `b12217` the better binary for `:8081` as well.
 
 ### 4.3 Part A: Similarity-Bounded Cold-Expert Substitution (`exp-approx-routing`)
 Opt-in MoE routing hook (`src/llama-approx-routing.{h,cpp}`, controlled by `LLAMA_APPROX_ROUTING`, zero overhead when unset) that computes per-layer mean-centered router cosine similarity from `blk.<L>.ffn_gate_inp.weight` and redirects cold low-weight tail experts (`w_rel < tau`, `protect_top=1`) to their highest-similarity distinct resident neighbor (`sim >= delta`).

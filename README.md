@@ -289,6 +289,27 @@ Tested on cold `llama-server` instances (Request #1 unless noted, greedy `temp=0
   2. **Mandatory pre-deployment validation gate:** Never promote a new `llama.cpp` build or GGUF based solely on 4K-context benchmarks or synthetic repetitive prompts. Always run a cold Request #1 realistic dense prompt (`>= 12K–18K` tokens, `cache_prompt=false`, `logprobs=true`) with `-md` active and assert `logprob != null` (no `NaN`s), coherent output, and non-regressed prefill wall time.
   3. **Uncensored Qwen3.6 verdict (`2026-11-24`):** Although `b12629` did not hit `NaN` on `Uncensored-HauhauCS-Q4_K_M` up to `25.6K` tokens, **`b12217` is strictly faster at every context length** (`+8.6%` 4K decode, `+27–36%` long-context prefill, `-26.2%` wall time at `25.6K`) and supports `mmproj` (`qwen3vl_merger`) cleanly, making `b12217` the better binary for `:8081` as well.
 
+### 4.2.2 `-ub` Scaling (`64 -> 256`) & `64K / 128K / 256K` Context Gate (`2026-11-25`)
+Measured on `b12217` (`build-dspine-v2`, `19e225579`) with `amdgpu.cwsr_enable=0`, `Qwen3.6-35B-A3B-UD-Q4_K_M` + `DFlash2` (`n7 p0.55`), native F16 KV, `cache_prompt=false`, `logprobs=true`, `temp=0`, `0` GPU resets, `0/0` graph reallocs, `NaN=False` across all runs (`bench-ub-ctx-gate.py`, `bench_ub_ctx_gate.csv`, `bench_ub_256k_probe.csv`):
+
+| Config | `-ub` | `-c` | Prompt Tokens | Prefill (`tok/s`) | Wall Time | Decode (`tok/s`) | DFlash2 Acc | GTT Peak | RAM `MemAvail` |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ub64_32k` *(baseline)* | `64` | `32,768` | `23,631` | `170.7` | `141.3 s` | `33.31` | `77.0%` | `25.98 GiB` | `15.58 GiB` |
+| `ub96_32k` | `96` | `32,768` | `23,631` | `195.1` (`+14.3%`) | `124.2 s` | `31.53` | `74.8%` | `26.03 GiB` | `15.59 GiB` |
+| `ub128_32k` | `128` | `32,768` | `23,631` | `218.1` (`+27.8%`) | `111.1 s` | `34.78` | `75.5%` | `26.06 GiB` | `15.87 GiB` |
+| `ctx64k_ub64` | `64` | `65,536` | `23,631` | `173.0` | `139.4 s` | `34.73` | `77.0%` | `26.61 GiB` | `15.47 GiB` |
+| `ctx128k_ub64` | `64` | `131,072` | `23,631` | `171.7` | `141.3 s` | `26.48` | `77.0%` | `27.87 GiB` | `11.93 GiB` |
+| `ctx256k_ub64` | `64` | `262,144` | `23,631` | `169.4` | `142.5 s` | `32.72` | `77.0%` | `30.38 GiB` | `12.08 GiB` |
+| `ctx256k_ub128` | `128` | `262,144` | `23,631` | `213.7` (`+26.2%`) | `113.5 s` | `33.39` | `75.5%` | `30.49 GiB` | `11.72 GiB` |
+| `ctx256k_ub192` | `192` | `262,144` | `23,631` | `235.7` (`+39.1%`) | `103.5 s` | `30.45` | `75.2%` | `30.56 GiB` | `11.66 GiB` |
+| **`ctx256k_ub256_23k`** | **`256`** | **`262,144`** | **`23,631`** | **`242.6` (`+43.2%`)** | **`100.6 s`** | **`31.17`** | **`77.0%`** | **`30.66 GiB`** | **`11.74 GiB`** |
+| **`ctx256k_ub256_55k`** | **`256`** | **`262,144`** | **`55,248`** | **`208.4`** | **`271.3 s`** | **`15.45`** | **`68.6%`** | **`30.66 GiB`** | **`11.21 GiB`** |
+
+- **Findings:**
+  1. **Native F16 KV scales cleanly at `+0.63 GiB` per `32K` tokens** on `Qwen3.6-35B-A3B` (only 10/40 layers allocate KV; 30/40 are fixed-size Gated DeltaNet), so `256K` (`-c 262144`) holds flat at `30.66 GiB` GTT even with `55,248` tokens filled (`11.21 GiB` RAM free).
+  2. **With `amdgpu.cwsr_enable=0` + `19e225579` prefill ubatch flush, `-ub 256` (with `-b 512`) is stable on `gfx1103`:** `+43.2%` faster `23.6K` prefill (`169.4 -> 242.6 tok/s`, `-41.9 s` wall time) for `+0.28 GiB` GTT, and passed a cold `55,248`-token prefill cleanly (`0` resets, `0` reallocs, `NaN=False`). Avoid `-ub 512+` (still risks MES watchdog resets on 12 CUs).
+  3. **Recommended split with pinned `gemma3:4b` (`3.0 GiB`):** `-ub 256 -c 262144` on `:8080` (`~33.7 GiB / 40 GiB` GTT, `6.3 GiB` spare) and `-ub 256 -c 131072` (or `262144`) on `:8081` (with `mmproj-f16`, `~31.9 GiB / 40 GiB` at `128K` -> `8.1 GiB` spare for vision encodes).
+
 ### 4.3 Part A: Similarity-Bounded Cold-Expert Substitution (`exp-approx-routing`)
 Opt-in MoE routing hook (`src/llama-approx-routing.{h,cpp}`, controlled by `LLAMA_APPROX_ROUTING`, zero overhead when unset) that computes per-layer mean-centered router cosine similarity from `blk.<L>.ffn_gate_inp.weight` and redirects cold low-weight tail experts (`w_rel < tau`, `protect_top=1`) to their highest-similarity distinct resident neighbor (`sim >= delta`).
 
@@ -401,7 +422,7 @@ export HIP_VISIBLE_DEVICES=0
 | **`-lm none`** (`--load-mode none`) | **Prevents Double-Allocation in RAM.** Default `mmap` caches the 21 GiB GGUF in Linux's filesystem page cache AND allocates 21 GiB in TTM GTT (`42 GiB` total), causing Linux swap thrashing and `amdgpu_amdkfd_restore_userptr_worker` hangs. `-lm none` loads tensors once directly into GTT (`~21.8 GiB` total). |
 | **`-fit off`** | **Disables Startup Dummy Context Probe.** By default, `llama.cpp` allocates and destroys a temporary 21 GiB GPU context at boot to probe free memory before allocating the real context. Turning `-fit off` stops back-to-back 21 GiB KFD queue teardowns. |
 | **`-fa on`** | **Enables RDNA3 FlashAttention.** Dramatically reduces KV-cache memory size and speeds up both prompt prefill (`165 tok/s`) and DFlash2 parallel token verification. |
-| **`-ub 64`** | **Caps Physical Micro-Batch Size at 64.** In `Qwen3.6-35B-A3B` (256 experts, 8 active/token), the default `-ub 512` launches a single `MUL_MAT_ID` GPU kernel with `512 * 8 = 4,096` non-contiguous expert gathers across 500 MB per layer, tripping the Radeon 780M (12 CUs) MES queue watchdog (`GPU reset`). `-ub 64` keeps every kernel fast and 100% stable on long agent prompts. |
+| **`-ub 256`** *(or `-ub 64` fallback)* | **Caps Physical Micro-Batch Size.** On `Qwen3.6-35B-A3B` (256 experts, 8 active/token), `-ub 512`+ launches a huge `MUL_MAT_ID` kernel across 12 RDNA3 CUs that can trip the MES watchdog (`GPU reset`). Earlier builds required `-ub 64`; with `amdgpu.cwsr_enable=0` + `19e225579` prefill ubatch flush, **`-ub 256`** (with `-b 512`) is verified stable up to `55.2K` cold tokens at `-c 262144` (`+43.2%` faster prefill: `169.4 -> 242.6 tok/s`, `0` resets). |
 | **`--spec-draft-n-max 7 --spec-draft-n-min 1 --spec-draft-p-min 0.55`** | **DFlash2 Adaptive Draft Block.** `qwen36-35b-a3b-dflash-Q8_0.gguf` has `dflash.block_size = 8` (max `7` draft tokens). `--spec-draft-p-min 0.55` truncates low-confidence tail tokens before Radeon 780M verification, and `exp-coalesced-dflash`'s `gf_res_prev[10]` HIP graph cache keeps batch sizes `1..8` fast (**37.3 tok/s** avg, **49.2 tok/s** reasoning bursts, 100% lossless). |
 | **`-t 12`** | **Core Reservation Safeguard.** Pairs with `dspine-v2-custom`'s closed 12-thread pool (`cores 0..11`), keeping 4 hardware threads (`cores 12..15`) dedicated to Ubuntu OS, Tailscale, Docker, and `local-agent`. |
 

@@ -559,6 +559,12 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
+static bool ggml_cuda_fattn_tile_supports_kv_q(const ggml_tensor * K, const ggml_tensor * V) {
+    return K->type == V->type &&
+        (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0) &&
+        (K->ne[0] == 64 || K->ne[0] == 128 || K->ne[0] == 256) && V->ne[0] == K->ne[0];
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -732,6 +738,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
+    // On RDNA3, symmetric q8_0/q4_0 KV uses tile dequant-on-load directly to avoid full-KV
+    // F16 scratch pre-dequantization. Set GGML_CUDA_FA_TILE_Q_MAX_Q to cap by query batch size.
+    if (amd_wmma_available(cc) && gqa_opt_applies && ggml_cuda_fattn_tile_supports_kv_q(K, V)) {
+        static const int64_t tile_q_max_q = []() {
+            const char * env = getenv("GGML_CUDA_FA_TILE_Q_MAX_Q");
+            return env ? std::max<int64_t>(0, atoll(env)) : INT64_MAX;
+        }();
+        if (Q->ne[1] <= tile_q_max_q) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+    }
+
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
@@ -747,6 +765,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
+            if (gqa_opt_applies && ggml_cuda_fattn_tile_supports_kv_q(K, V)) {
+                return BEST_FATTN_KERNEL_TILE;
+            }
             if (Q->ne[1] <= 2) {
                 return BEST_FATTN_KERNEL_VEC;
             }
@@ -771,7 +792,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     bool need_f16_V = false;
 
     switch (kernel) {
-        case BEST_FATTN_KERNEL_TILE:
+        case BEST_FATTN_KERNEL_TILE: {
+            const bool tile_q = ggml_cuda_fattn_tile_supports_kv_q(K, V);
+            need_f16_K = !tile_q;
+            need_f16_V = !tile_q;
+        } break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;

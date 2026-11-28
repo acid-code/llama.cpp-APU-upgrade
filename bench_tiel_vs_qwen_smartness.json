@@ -1,0 +1,128 @@
+{
+  "qwen_q4km": {
+    "code_exec": {
+      "dec_tps": 41.62,
+      "acc_pct": 75.2,
+      "wall_s": 38.1,
+      "grade": "ERR (KeyError: 'merge_with_cooldown')",
+      "answer": "",
+      "think_len": 5343
+    },
+    "bug_hunt": {
+      "dec_tps": 30.57,
+      "acc_pct": 62.9,
+      "wall_s": 51.0,
+      "grade": "",
+      "answer": "",
+      "think_len": 6226
+    },
+    "agent_json": {
+      "dec_tps": 47.13,
+      "acc_pct": 86.2,
+      "wall_s": 1.8,
+      "grade": "STRICT_PASS",
+      "answer": "{\"tool\":\"read_file\",\"args\":{\"path\":\"/opt/llama-server/run.sh\",\"start_line\":120,\"end_line\":160},\"reason\":\"To inspect lines 120 to 160 of /opt/llama-server/run.sh for batch flags.\"}",
+      "think_len": 0
+    },
+    "general_qa": {
+      "dec_tps": 32.91,
+      "acc_pct": 63.5,
+      "wall_s": 41.9,
+      "grade": "",
+      "answer": "- **ECSC Establishment:** Founded in 1951 by the Treaty of Paris.\n- **DDR5 MoE Bottleneck:** APUs share system RAM with the GPU, and MoE decoding is intensely memory-bandwidth-bound due to irregular, sparse expert weight fetches; dual-channel DDR5 saturates its bandwidth ceiling before compute CUs are utilized, stalling execution regardless of idle compute resources.\n- **Futex vs. Spinlock:** A futex combines a fast userspace lock with efficient kernel blocking when contended, avoiding context switches when uncontended; a spinlock busy-waits continuously in kernel/userspace until available, avoiding context switches but consuming CPU cycles, making it suitable only for very short critical sections or interrupt contexts.",
+      "think_len": 4896
+    },
+    "hebrew": {
+      "dec_tps": 26.13,
+      "acc_pct": 60.2,
+      "wall_s": 57.4,
+      "grade": "",
+      "answer": "1. **הבדל תפקודי:** זיכרון RAM רגיל הוא הזיכרון הראשי שבו ה-CPU מאחסן נתונים ומריץ תוכניות כלליות, בעוד ש-GTT (Graphics Translation Table) הוא אזור זיכרון מוקצה במיוחד לכרטיס הגרפיקה המובנה ב-APU של AMD, המשמש בעיקר לעיבוד תמונות, ממשקים גרפיים וטקסטורות.\n\n2. **הבדל נגישות וניהול:** ה-RAM נגיש ישירות על ידי ה-CPU לחישובים כלליים, בעוד ש-GTT מנוהל על ידי ה-GPU ומשמש להצגת ויזואליה; במעבדי APU שני האזורים חולקים את אותו גוף זיכרון פיזי, אך ה-GTT מוקצה באופן ייעודי לגרפיקה ואינו זמין ישירות ל-CPU לשימוש כללי.\n\n3. **חשיבות מרווח זיכרון פנוי:** מודלי שפה מקומיים דורשים כמות גדולה של זיכרון לטעינת המשקולות והרצת החישובים; אם הזיכרון תפוס על ידי מערכת ההפעלה, אפליקציות אחרות או הקצאות גרפיות (כולל GTT), המערכת תעבור להחלפה לדיסק (Swap) מה שמאט את הביצועים בפי עשרות או גורם לקריסה, במיוחד במערכות עם זיכרון משותף כמו ב-APU שבהן התחרות על הזיכרון בין CPU ל-GPU קריטית.",
+      "think_len": 3038
+    }
+  },
+  "qwen_iq4xs": {
+    "code_exec": {
+      "dec_tps": 38.64,
+      "acc_pct": 72.8,
+      "wall_s": 40.7,
+      "grade": "ERR (KeyError: 'merge_with_cooldown')",
+      "answer": "",
+      "think_len": 5148
+    },
+    "bug_hunt": {
+      "dec_tps": 27.87,
+      "acc_pct": 60.5,
+      "wall_s": 55.8,
+      "grade": "",
+      "answer": "",
+      "think_len": 6304
+    },
+    "agent_json": {
+      "dec_tps": 47.33,
+      "acc_pct": 81.0,
+      "wall_s": 1.8,
+      "grade": "STRICT_PASS",
+      "answer": "{\"tool\":\"read_file\",\"args\":{\"path\":\"/opt/llama-server/run.sh\",\"start_line\":120,\"end_line\":160},\"reason\":\"To inspect lines 120 to 160 of /opt/llama-server/run.sh for batch flags.\"}",
+      "think_len": 0
+    },
+    "general_qa": {
+      "dec_tps": 31.29,
+      "acc_pct": 69.6,
+      "wall_s": 25.8,
+      "grade": "",
+      "answer": "- **ECSC Establishment:** Created in 1951 by the Treaty of Paris.\n- **DDR5 MoE Bottleneck:** MoE decoding is strictly memory-bandwidth-bound, not compute-bound; since APUs share system RAM, dual-channel DDR5's fixed bandwidth caps data delivery, starving the GPU even when compute units sit idle.\n- **Futex vs. Spinlock:** A futex is a hybrid userspace/kernel primitive that sleeps on contention to avoid CPU waste, while a spinlock is a kernel-only busy-wait lock that continuously polls until available, reserved for extremely short critical sections or interrupt-disabled contexts.",
+      "think_len": 2697
+    },
+    "hebrew": {
+      "dec_tps": 24.99,
+      "acc_pct": 58.1,
+      "wall_s": 62.1,
+      "grade": "",
+      "answer": "",
+      "think_len": 4480
+    }
+  },
+  "tiel_iq4xs": {
+    "code_exec": {
+      "dec_tps": 38.34,
+      "acc_pct": 71.9,
+      "wall_s": 22.3,
+      "grade": "PASS 6/6",
+      "answer": "```python\ndef merge_with_cooldown(intervals, cooldown):\n    if not intervals:\n        return []\n    intervals = sorted(intervals, key=lambda x: x[0])\n    merged = [list(intervals[0])]\n    for start, end in intervals[1:]:\n        if start <= merged[-1][1] + cooldown:\n            merged[-1][1] = max(merged[-1][1], end)\n        else:\n            merged.append([start, end])\n    return merged\n```",
+      "think_len": 2181
+    },
+    "bug_hunt": {
+      "dec_tps": 25.77,
+      "acc_pct": 57.3,
+      "wall_s": 61.1,
+      "grade": "",
+      "answer": "",
+      "think_len": 6062
+    },
+    "agent_json": {
+      "dec_tps": 39.48,
+      "acc_pct": 74.4,
+      "wall_s": 2.2,
+      "grade": "STRICT_PASS",
+      "answer": "{\"tool\":\"read_file\",\"args\":{\"path\":\"/opt/llama-server/run.sh\",\"start_line\":120,\"end_line\":160},\"reason\":\"Inspect batch flags in run.sh\"}",
+      "think_len": 0
+    },
+    "general_qa": {
+      "dec_tps": 26.69,
+      "acc_pct": 56.9,
+      "wall_s": 23.0,
+      "grade": "",
+      "answer": "- **ECSC:** Established by the **Treaty of Paris (1951)**, signed 18 April 1951 and effective 23 July 1952, by the six founding states (Belgium, France, West Germany, Italy, Luxembourg, Netherlands).\n\n- **MoE decode bottleneck:** MoE decode is **memory-bandwidth-bound, not compute-bound**—each token read pulls large expert weights from RAM. On an APU the GPU uses unified system memory (UMA), so throughput is capped by the memory controller's bandwidth (dual-channel DDR5), not by the CUs. The CUs sit idle because they're starved waiting for data, not because they're saturated.\n\n- **Futex vs spinlock:** A **spinlock** busy-waits on the CPU, spinning until the lock frees (never blocks). A **futex** (fast userspace mutex) is hybrid: uncontended locking happens in userspace with no syscall, but contended waiters **block (sleep) in the kernel** and are woken when released. Use spinlocks only for very short critical sections; futexes for longer ones where blocking beats spinning.",
+      "think_len": 1417
+    },
+    "hebrew": {
+      "dec_tps": 21.28,
+      "acc_pct": 53.2,
+      "wall_s": 30.9,
+      "grade": "",
+      "answer": "1. **RAM רגיל** הוא הזיכרון שאתה קונה והמתקין במחשב (DDR) — מהיר, ייעודי למערכת, ומוקצה על ידי מעצ\"ב (CPU).\n\n2. **GTT** (Graphics Translation Table) הוא מנגנון שבו ה-GPU המשובץ ב-APU משתמש בחלק מזיכרון ה-RAM הקיים כזיכרון מסך (VRAM וירטואלי), כי ל-APU אין זיכרון מסך נפרד. כלומר: אותו RAM פיזי, רק שהגישה אליו דרך כרטיף המסך במקום דרך המעבד — וזה **איטי יותר** מזיכרון מסך ייעודי.\n\n3. **למה להשאיר מרווח פנוי:** כשריצים מודל שפה מקומי על APU, המודל תפוס בזיכרון. אם תמלא את ה-RAM עד הסוף, המערכת תתחיל להשתמש בקובץ החלפה (swap) על הדיסק — איטי בהרבה, וגורם להאטות קשות או לקריסות. מרווח פנוי שומר על יציבות המערכת, נותן מקום למעצ\"ב, למנועי ההפעלה, ולמטמון שצריך בזמן ריצה בלי \"הצפה\" (thrashing) שתהרוס את הביצועים.",
+      "think_len": 1111
+    }
+  }
+}

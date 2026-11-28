@@ -252,7 +252,7 @@ Measured on `Qwen3.6-35B-A3B` + `DFlash2` (`-c 32768 -np 1 -fa on -ub 64 -b 512 
 | `16K_code T2` (prefix hit) | `18,763` | `18,637` | `126` | `114.1` | **`1.10`** | **`24.95`** | `65.4%` | `3.12` |
 
 - **Long-Context Findings for `local-agent`:**
-  1. **Do NOT use `-ctk q8_0 -ctv q8_0` on `Qwen3.6-35B-A3B` + `DFlash2`:** Only 10/40 layers use attention (Gated DeltaNet), so native F16 KV at `-c 32768` uses only `~640 MiB`. Enabling `q8_0` KV forces `ggml-cuda/fattn.cu` `BEST_FATTN_KERNEL_MMA_F16` (`DKQ=256, gqa=8, n_tokens >= 3`) to dequantize K/V into temporary F16 buffers on every step, dropping 18K-22K decode from **`25.0-25.6 tok/s`** down to `~19.2 tok/s`.
+  1. **`q8_0` KV requires the `fa-tile-dequant-on-load` patch (Section 4.2.3):** On unpatched `b12217`, `-ctk q8_0 -ctv q8_0` forced `BEST_FATTN_KERNEL_MMA_F16` (`DKQ=256, gqa=8`) to pre-dequantize K/V into temporary F16 scratch on every step, dropping 18K-22K decode from `25.0-25.6` to `~19.2 tok/s`. With `fa-tile-dequant-on-load` (Section 4.2.3), **`-ctk q8_0 -ctv q8_0` is now faster than F16** (`+35.5%` decode at 24K, `+59.5%` decode at 56K) and cuts `256K` GTT by `2.37 GiB`.
   2. **Prefix caching (`cache_prompt=true` + `-np 1`) cuts 18.7K TTFT by 96x (`105.8 s -> 1.10 s`):** Keep system prompt and repo context prefixes stable across turns and set client HTTP timeout >= `300 s` for cold 16K-24K Turn-1 prefills.
   3. **`amdgpu.cwsr_enable=0` in GRUB is mandatory on `gfx1103`:** Eliminated recurring `MES failed to respond to msg=REMOVE_QUEUE` / `Failed to evict queue 3` GPU resets when `ctx_tgt` (queue 2) and `ctx_dft` (queue 3) run long multi-turn sessions.
 
@@ -308,7 +308,31 @@ Measured on `b12217` (`build-dspine-v2`, `19e225579`) with `amdgpu.cwsr_enable=0
 - **Findings:**
   1. **Native F16 KV scales cleanly at `+0.63 GiB` per `32K` tokens** on `Qwen3.6-35B-A3B` (only 10/40 layers allocate KV; 30/40 are fixed-size Gated DeltaNet), so `256K` (`-c 262144`) holds flat at `30.66 GiB` GTT even with `55,248` tokens filled (`11.21 GiB` RAM free).
   2. **With `amdgpu.cwsr_enable=0` + `19e225579` prefill ubatch flush, `-ub 256` (with `-b 512`) is stable on `gfx1103`:** `+43.2%` faster `23.6K` prefill (`169.4 -> 242.6 tok/s`, `-41.9 s` wall time) for `+0.28 GiB` GTT, and passed a cold `55,248`-token prefill cleanly (`0` resets, `0` reallocs, `NaN=False`). Avoid `-ub 512+` (still risks MES watchdog resets on 12 CUs).
-  3. **Recommended split with pinned `gemma3:4b` (`3.0 GiB`):** `-ub 256 -c 262144` on `:8080` (`~33.7 GiB / 40 GiB` GTT, `6.3 GiB` spare) and `-ub 256 -c 131072` (or `262144`) on `:8081` (with `mmproj-f16`, `~31.9 GiB / 40 GiB` at `128K` -> `8.1 GiB` spare for vision encodes).
+  3. **Recommended split with pinned `gemma3:4b` (`3.0 GiB`):** With `fa-tile-dequant-on-load` (`-ctk q8_0 -ctv q8_0`, Section 4.2.3 below), **both** `:8080` and `:8081` (with `mmproj-f16`) fit cleanly at full `-ub 256 -c 262144` with `~11-12 GiB` spare GTT.
+
+### 4.2.3 `fa-tile-dequant-on-load` Quantized KV (`q8_0` / `q4_0`) Benchmark (`2026-11-28`)
+Ported `Nathanw1014/llama.cpp` commit `b781a8d5dc` (`flash_attn_tile_load_tile_q` in `ggml/src/ggml-cuda/fattn-tile.{cu,cuh}`) onto our `b12217` stack, plus RDNA3 `fattn.cu` tile dispatch for symmetric `q8_0`/`q4_0` (`DKQ=64/128/256`) and zero-scratch `get_alloc_size`. Measured on `Qwen3.6-35B-A3B-UD-Q4_K_M` + `DFlash2` (`n7 p0.55`, `-c 262144 -ub 256 -b 512`, `cache_prompt=false`, `logprobs=true`, `0` GPU resets, `0/0` graph reallocs, `NaN=False`, `bench-fa-q8-kv.py` / `bench_fa_q8_kv.csv`):
+
+| Case (`-c 262144 -ub 256`) | KV | Prompt Tokens | Prefill (`tok/s`) | Decode (`tok/s`) | DFlash2 Acc | GTT Load / Peak *(w/ `gemma3:4b`)* | RAM `MemAvail` | vs Stock `f16` |
+| :--- | :--- | ---: | ---: | ---: | ---: | :---: | ---: | :--- |
+| `stock_f16_24k` | `f16` | `24,099` | `233.8` | `24.99` | `74.8%` | `26.79 / 30.66 GiB` | `11.27 GiB` | baseline |
+| `stock_q8_24k` | `q8_0` | `24,099` | `245.8` | `26.04` | `72.3%` | `24.92 / 28.80 GiB` | `13.63 GiB` | `+4.2%` dec, `-1.86 GiB` |
+| `patch_q8_max8_24k` | `q8_0` | `24,099` | `256.9` | `23.81` | `75.4%` | `24.93 / 28.79 GiB` | `13.63 GiB` | `+9.9%` PP, `-1.87 GiB` |
+| **`patch_q8_all_24k` (WINNER)** | **`q8_0`** | `24,099` | `230.7` | **`33.85`** | **`78.9%`** | **`24.45 / 28.29 GiB`** | **`14.09 GiB`** | **`+35.5%` decode, `-2.37 GiB` GTT** |
+| `patch_q4_all_24k` | `q4_0` | `24,099` | `230.4` | `33.78` | `75.2%` | `23.20 / 27.04 GiB` | `15.20 GiB` | `+35.2%` decode, `-3.62 GiB` GTT |
+| *Stock `f16` at 55K (Sec 4.2.2)* | `f16` | `55,248` | `208.4` | `15.45` | `68.6%` | `- / 30.66 GiB` | `11.21 GiB` | baseline (55K) |
+| **`patch_q8_all_55k` (WINNER)** | **`q8_0`** | **`55,814`** | `169.6` | **`24.65`** | **`74.0%`** | **`24.45 / 28.29 GiB`** | **`13.90 GiB`** | **`+59.5%` decode at 56K, `-2.37 GiB` GTT** |
+
+- **Smoke-test verification:** 4K `Qwen3.6-UD-Q4_K_M` + `DFlash2` + `q8_0` KV hit **`45.72 tok/s`** (`80.2%` acc, `21.72 GiB` GTT, `NaN=False`); `:8081` `Qwen3.6` + `mmproj-f16` + `DFlash2` + `q8_0` KV at full `256K` used only **`24.87 GiB` GTT** (`25.08 GiB` peak during vision, `42.58 tok/s` decode, `9.34 s` image pass, `NaN=False`).
+
+### 4.2.4 `Tiel-Coder-35B-A3B` vs `Qwen3.6-35B-A3B` (`UD-IQ4_XS` vs `UD-Q4_K_M`) Comparison (`2026-11-28`)
+Tested `peculiar-ragdoll/Tiel-Coder-35B-A3B-UD-IQ4_XS` (`16.51 GiB`, `qwen3_5_moe`) against `Qwen3.6-35B-A3B-UD-IQ4_XS` (`16.51 GiB`) and `Qwen3.6-35B-A3B-UD-Q4_K_M` (`20.61 GiB`) on `b12217` (`-ub 256 -b 512`, `bench-tiel-coder.py` / `bench_tiel_vs_qwen.csv`, `0` resets, `0/0` reallocs, `NaN=False`):
+
+| Model | Disk / 4K GTT | Raw Decode | Best `DFlash2` | 4K Decode | Acc% | 23.6K PP / Dec | Notes |
+| :--- | :---: | ---: | :--- | ---: | ---: | :---: | :--- |
+| **`Qwen3.6-35B-A3B-UD-Q4_K_M`** | `20.6 / 21.8 GiB` | `18.78` | `n7 p0.55` | **`45.20`** | **`82.8%`** | `242.6 / 31.17` | **Winner:** fastest real-world + cleanest Hebrew |
+| `Qwen3.6-35B-A3B-UD-IQ4_XS` | `16.5 / 17.7 GiB` | `18.56` | `n7 p0.55` | `45.48` | `81.7%` | `257.4 / 31.49` | Saves `4.1 GiB` GTT, no decode speedup (IQ4 ALU) |
+| `Tiel-Coder-35B-A3B-UD-IQ4_XS` | `16.5 / 17.7 GiB` | `18.97` | `n7 p0.60` | `33.02` | `69.0%` | `263.2 / 28.81` | `-27%` slower w/ Qwen DFlash2; degraded Hebrew |
 
 ### 4.3 Part A: Similarity-Bounded Cold-Expert Substitution (`exp-approx-routing`)
 Opt-in MoE routing hook (`src/llama-approx-routing.{h,cpp}`, controlled by `LLAMA_APPROX_ROUTING`, zero overhead when unset) that computes per-layer mean-centered router cosine similarity from `blk.<L>.ffn_gate_inp.weight` and redirects cold low-weight tail experts (`w_rel < tau`, `protect_top=1`) to their highest-similarity distinct resident neighbor (`sim >= delta`).

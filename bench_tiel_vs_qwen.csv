@@ -1,0 +1,13 @@
+label,ctx,in_toks,avg_pp_tps,avg_dec_tps,avg_acc_pct,avg_len,gtt_gib,wall_s,nan,resets,reallocs
+qwen_q4km_nodraft,4096,46,101.76,18.78,0.00,1.00,20.52,21.84,False,0,0
+qwen_q4km_dflash_n7_p55,4096,46,99.04,45.20,82.79,5.92,21.84,10.09,False,0,0
+qwen_iq4xs_nodraft,4096,46,106.97,18.56,0.00,1.00,20.05,22.02,False,0,0
+qwen_iq4xs_dflash_n7_p55,4096,46,105.64,45.48,81.74,5.88,17.74,9.89,False,0,0
+qwen_iq4xs_dflash_n7_p60,4096,46,107.61,45.29,85.91,5.77,17.74,9.84,False,0,0
+tiel_iq4xs_nodraft,4096,225,218.27,18.97,0.00,1.00,16.42,23.26,False,0,0
+tiel_iq4xs_dflash_n7_p50,4096,225,209.94,31.67,54.55,4.10,17.75,15.96,False,0,0
+tiel_iq4xs_dflash_n7_p55,4096,225,205.06,32.39,67.87,4.20,21.39,15.85,False,0,0
+tiel_iq4xs_dflash_n7_p60,4096,225,208.22,33.02,68.97,4.22,17.75,15.08,False,0,0
+tiel_iq4xs_dflash_n7_p65,4096,225,209.01,32.95,75.19,4.22,17.75,14.95,False,0,0
+qwen_iq4xs_23k_gate,32768,24099,257.37,31.49,69.44,4.75,21.94,96.69,False,0,0
+tiel_iq4xs_23k_gate,32768,24278,263.16,28.81,72.00,4.43,22.08,95.61,False,0,0

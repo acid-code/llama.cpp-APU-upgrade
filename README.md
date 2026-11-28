@@ -334,6 +334,16 @@ Tested `peculiar-ragdoll/Tiel-Coder-35B-A3B-UD-IQ4_XS` (`16.51 GiB`, `qwen3_5_mo
 | `Qwen3.6-35B-A3B-UD-IQ4_XS` | `16.5 / 17.7 GiB` | `18.56` | `n7 p0.55` | `45.48` | `81.7%` | `257.4 / 31.49` | Saves `4.1 GiB` GTT, no decode speedup (IQ4 ALU) |
 | `Tiel-Coder-35B-A3B-UD-IQ4_XS` | `16.5 / 17.7 GiB` | `18.97` | `n7 p0.60` | `33.02` | `69.0%` | `263.2 / 28.81` | `-27%` slower w/ Qwen DFlash2; degraded Hebrew |
 
+### 4.2.5 Optional Active-Expert Pruning (`--override-kv qwen35moe.expert_used_count`, `2026-11-28`)
+Tested zero-code active-expert reduction (`top-8` default vs `top-7`, `top-6`, `top-5`) on `b2143c676` (`Qwen3.6-35B-A3B-UD-Q4_K_M` + `DFlash2` `n7 p0.55`, `q8_0` KV, `-ub 256`, `NaN=False`, `0` resets; `bench-topk-qwen36.py` / `bench_topk_qwen36.csv`):
+
+| `expert_used_count` | 4K Decode (`tok/s`) | 4K PP | 4K `DFlash2` Acc | 16-Chunk Tech PPL | `dPPL` vs Top-8 | 24.8K Cold PP / Dec | `code_exec` / `agent_json` | Notes |
+| :---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: | :--- |
+| **`8` (default)** | `44.28` | `97.1` | `85.2%` | **`5.9970`** | `0.00%` | `223.8 / 21.09` | `PASS 6/6` / `STRICT_PASS` | **Kept as default** (100% exact) |
+| `7` | `46.70` (`+5.5%`) | `99.3` | `85.9%` | `6.0216` | `+0.41%` | - | `PASS 6/6` / `STRICT_PASS` | Practically lossless speed knob (`--override-kv qwen35moe.expert_used_count=int:7`) |
+| `6` | `49.88` (`+12.6%`) | `106.5` | `80.9%` | `6.1412` | `+2.40%` | `241.0 / 25.57` (`+21.2%`) | `PASS 6/6` / `STRICT_PASS` | Faster, but long-ctx acc drops (`57.2%`) + slight Hebrew drift |
+| `5` | `50.76` (`+14.6%`) | `116.1` | `80.9%` | `6.3260` | `+5.49%` | - | - | Past quality cliff; skip |
+
 ### 4.3 Part A: Similarity-Bounded Cold-Expert Substitution (`exp-approx-routing`)
 Opt-in MoE routing hook (`src/llama-approx-routing.{h,cpp}`, controlled by `LLAMA_APPROX_ROUTING`, zero overhead when unset) that computes per-layer mean-centered router cosine similarity from `blk.<L>.ffn_gate_inp.weight` and redirects cold low-weight tail experts (`w_rel < tau`, `protect_top=1`) to their highest-similarity distinct resident neighbor (`sim >= delta`).
 
